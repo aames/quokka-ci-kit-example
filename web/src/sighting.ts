@@ -37,3 +37,5 @@ export function describe(s: Sighting): string {
   const lead = words.charAt(0).toUpperCase() + words.slice(1);
   return `${lead} ${noun} at ${s.where.trim()} on ${perthDate(s.created)}.`;
 }
+
+// First change pushed through the hook.
