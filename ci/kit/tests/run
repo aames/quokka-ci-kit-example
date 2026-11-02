@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# THE KIT'S PROOFS THAT NEED NO DOCKER DAEMON (kit/README.md §6.1,
+# §6.2). One file per family under fam/, each a function fam_<name>; the
+# docker, gh, curl and sleep shims and the fixture repository are
+# fixture/. It is the kit job's verdict (`bash ci/kit/tests/run` in the base
+# image) and runs by hand on a workstation or a runner.
+#
+#   bash kit/tests/run [<job>] [--family <name>]...   (--list names them)
+#
+# Prints `ok:` or `FAIL:` per case, `NOT RUN <leg>: <reason>` for a platform
+# leg it cannot run, and on success ends with the counts line
+#   ${CIKIT_PROJECT}-ci-job v1 counts ${CIKIT_JOB} kit_cases <n>
+# (kitfix and kitself when run by hand). Exit 0 all held; 1 a case failed.
+# Honest exit codes throughout: no status is read through a pipe.
+#
+# KITT_KIT names the kit tree under test (default: this file's); tests/plants
+# points it at a copy with one planted defect to show a family turns red.
+# KITT_QUIET=1 prints only failures.
+# shellcheck disable=SC2154,SC2034,SC2016
+set -uo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+. "$here/lib.sh"
+
+all_families="keys dump manifest green local plan extension record prune driver shape signpush hook workflow escaping prereq launcher reader twokeys update host flow"
+want=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --family) want="$want $2"; shift 2 ;;
+    --list) echo "$all_families"; exit 0 ;;
+    # cikit-enter runs `bash "$CIKIT_ADAPTER" <job>`: the kit job's verdict is this
+    # file, handed its own job name, which it takes and ignores.
+    "$KITT_JOB") shift ;;
+    *) echo "usage: run [--family <name>]... | --list" >&2; exit 2 ;;
+  esac
+done
+[ -n "$want" ] || want="$all_families"
+
+for f in $want; do
+  case " $all_families " in *" $f "*) ;; *) echo "no family named $f" >&2; exit 2 ;; esac
+  # shellcheck disable=SC1090
+  . "$here/fam/$f.sh"
+  family="$f"
+  "fam_$f"
+done
+
+echo "cases: $cases, failures: $failures"
+if [ "$failures" -ne 0 ]; then
+  exit 1
+fi
+echo "${KITT_PROJECT}-ci-job v1 counts ${KITT_JOB} kit_cases ${cases}"

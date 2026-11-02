@@ -1,0 +1,259 @@
+# CI for the quokka sightings project, in the vendored kit's shape
+# (ci/kit/README.md; the kit's DESIGN.md section 5.6).
+#
+# `checks` runs first on every run. Its Plan step computes each job's key (a
+# hash of the paths ci/manifest lists for it) and looks for a record of that
+# key: a green record CI wrote, or a signed local record a workstation's
+# `make check` and pre-push hook wrote. A job whose key has a trusted record
+# is skipped; every other job runs. The plan's summary table shows which, and
+# on what record.
+#
+# On Monday's schedule the plan ignores every local record, so each job runs
+# in CI unless CI itself already passed that exact tree: the independent check.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "20 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Ignore every record and run every job
+        type: boolean
+        default: false
+      task:
+        description: tests, the usual run; weekly, the independent check
+        type: choice
+        options: [tests, weekly]
+        default: tests
+      delete:
+        description: weekly only; the prune deletes the old records it would otherwise list
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      checks: read
+    concurrency:
+      group: ci-checks-${{ github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      ref_group: ${{ steps.plan.outputs.ref_group }}
+      main: ${{ steps.plan.outputs.main }}
+      checks: ${{ steps.plan.outputs.checks }}
+      api: ${{ steps.plan.outputs.api }}
+      web: ${{ steps.plan.outputs.web }}
+      kit: ${{ steps.plan.outputs.kit }}
+      checks_key: ${{ steps.plan.outputs.checks_key }}
+      api_key: ${{ steps.plan.outputs.api_key }}
+      web_key: ${{ steps.plan.outputs.web_key }}
+      kit_key: ${{ steps.plan.outputs.kit_key }}
+    steps:
+      - name: Refuse a draft pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so no checks ran. Mark it ready for review to run them."
+          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Plan
+        id: plan
+        env:
+          CI_PLAN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_PLAN_EVENT: ${{ github.event_name }}
+          CI_PLAN_FORCE: ${{ inputs.force && 'true' || 'false' }}
+          CI_PLAN_TASK: ${{ inputs.task }}
+          CI_PLAN_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/kit/bin/plan
+      - name: The manifest lint
+        if: steps.plan.outputs.checks == 'run'
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ci/kit/bin/check-manifest --commit "$SHA"
+      - name: The workflow fence
+        if: steps.plan.outputs.checks == 'run'
+        run: python3 ci/kit/bin/check-workflow
+      - name: The escaping-read fence
+        if: steps.plan.outputs.checks == 'run'
+        run: python3 ci/kit/bin/check-escaping-reads
+      - name: Record this tree green
+        if: success() && steps.plan.outputs.checks == 'run'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ steps.plan.outputs.checks_key }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ci/kit/bin/record checks "$KEY" "$SHA"
+
+  api:
+    name: api
+    needs: checks
+    if: needs.checks.outputs.api == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-api-${{ needs.checks.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - name: Cache Go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/rottnest-ci-gomod
+          key: rottnest-ci-gomod-${{ runner.os }}-${{ hashFiles('api/go.sum') }}
+      - name: Date stamp for the build cache key
+        id: gobuild
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Cache the Go build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/rottnest-ci-gobuild
+          key: rottnest-ci-gobuild-${{ runner.os }}-${{ steps.gobuild.outputs.date }}
+      - name: The job image
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA"
+      - name: The api verdict
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" api
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.checks.outputs.api_key }}
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/record api "$KEY" "$SHA"
+
+  web:
+    name: web
+    needs: checks
+    if: needs.checks.outputs.web == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-web-${{ needs.checks.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - name: Cache npm's downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/rottnest-ci-npm
+          key: rottnest-ci-npm-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+      - name: The job image
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA"
+      - name: The web verdict
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" web
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.checks.outputs.web_key }}
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/record web "$KEY" "$SHA"
+
+  kit:
+    name: kit
+    needs: checks
+    if: needs.checks.outputs.kit == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-kit-${{ needs.checks.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - name: The job image
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA" kit
+      - name: The kit's own proofs, vendored
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" kit
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.checks.outputs.kit_key }}
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/record kit "$KEY" "$SHA"
+
+  # The weekly prune of old records, on main only. On the schedule it is a dry
+  # run that lists what it would delete; a dispatch with task weekly and
+  # delete ticked deletes them.
+  prune:
+    name: prune
+    needs: checks
+    if: needs.checks.outputs.main == 'true' && (github.event_name == 'schedule' || inputs.task == 'weekly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Prune the green and local records older than the manifest's prune-days
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.checks.outputs.sha }}
+          DELETE: ${{ inputs.delete && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          bash ci/kit/bin/prune green "$SHA" "$DELETE"
+          bash ci/kit/bin/prune local "$SHA" "$DELETE"

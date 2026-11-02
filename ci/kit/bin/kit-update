@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#
+# THE UPDATE OF THE VENDORED KIT (kit/README.md §5.2, §5.3).
+#
+#   ci/kit/bin/kit-update <tag> [--verify-only] [<url>]
+#
+# Run by a person at the top of an adopter's working copy, from a checkout of
+# main, never in CI (DESIGN.md §3.4). It is the scheme's one network act:
+#   1. It clones <url> (default https://github.com/aames/quokka-ci-kit.git) in
+#      full, with no checkout, into a temporary directory, and fetches the
+#      tag by name.
+#   2. It accepts <tag> only as a RELEASE (kit/README.md §5.3):
+#      (a) refs/tags/<tag> is an annotated tag object whose own `type` header
+#          is `commit` and whose own `tag` header is <tag>;
+#      (b) the first line of its message is exactly `quokka-ci-kit <tag>`;
+#      (c) its commit is the kit's main, or an ancestor of it, in that clone;
+#      (d) `git tag -v` exits 0 and its STANDARD ERROR alone, line by line,
+#          holds exactly one line `Good "git" signature for <principal> with
+#          <type> key <fingerprint>`, whose principal is the signer;
+#      (e) the allowed-signers file is ci/KIT-SIGNERS as the adopter's
+#          refs/remotes/origin/<main-branch> carries it (main-branch from the
+#          working copy's ci/manifest through the one parser, `main` when there
+#          is none), and the working copy's copy must equal it; when main
+#          carries none (the first vendoring), the working copy's is used and
+#          each line's fingerprint is printed for confirmation out of band.
+#      The tag's kit/ tree must hold regular files alone (no symlink, no
+#      submodule).
+#   3. It writes the tag's kit/ tree into a scratch work tree by git's own
+#      checkout, proves that tree hashes to `<tag>^{commit}:kit`, then
+#      replaces ci/kit/ with it byte for byte and writes ci/KIT-VERSION's five
+#      lines (tag, commit, tree, signer, vendored).
+#   4. It prints the tag's entry in its CHANGELOG.md, the adopter's actions.
+# --verify-only stops after step 2 and prints the five lines; nothing in the
+# working copy changes. The person then runs the check command (every local
+# key moved, kit/README.md §5.4) and opens one pull request naming the tag, the
+# commit, the tree and the notes' "moves keys" line.
+#
+# BASH 3.2: this runs under the macOS /bin/bash. Its external commands are
+# git, ssh-keygen, mkdir, mv, rm, mktemp and date, inside the host
+# allow-list; no host tool parses any output (bash's own [[ =~ ]], case and
+# read do). The working copy's ci/manifest is read by the sibling library's
+# parser in a child under "$BASH".
+#
+# EXIT: 0 updated, or verified with --verify-only; 2 a refusal, and then
+# ci/kit and ci/KIT-VERSION are as they were.
+set -euo pipefail
+
+readonly DEFAULT_URL=https://github.com/aames/quokka-ci-kit.git
+readonly RE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+readonly RE_HEX='^[0-9a-f]{40}([0-9a-f]{24})?$'
+readonly RE_GOOD='^Good "git" signature for ([^ ]+) with [^ ]+ key [^ ]+$'
+readonly RE_KEYTYPE='^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)$'
+# The kit repository's protected branch, on which every release commit sits.
+readonly KIT_MAIN=main
+
+refuse() { printf '%s\n' "$1" >&2; exit 2; }
+usage() { refuse "usage: kit-update <tag> [--verify-only] [<url>]"; }
+
+tag="" verify_only=false url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --verify-only) verify_only=true ;;
+    -*) usage ;;
+    *)
+      if [ -z "$tag" ]; then tag="$1"; elif [ -z "$url" ]; then url="$1"; else usage; fi
+      ;;
+  esac
+  shift
+done
+[ -n "$tag" ] || usage
+url="${url:-$DEFAULT_URL}"
+[[ "$tag" =~ $RE_TAG ]] || refuse "${tag} is not a release tag (vMAJOR.MINOR.PATCH), so nothing was changed."
+
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY
+top="$(git rev-parse --show-toplevel 2> /dev/null)" || refuse "This is not inside a git working copy, so nothing was changed."
+[ -f "${top}/ci/KIT-SIGNERS" ] || refuse "There is no ci/KIT-SIGNERS in this working copy, so no release can be verified and nothing was changed."
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/cikit-update.XXXXXX")" || refuse "No temporary directory could be made, so nothing was changed."
+cleanup() { rm -rf -- "$tmp"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+clone="${tmp}/clone"
+
+# (e) The signers file: main's, which the working copy's must equal; the
+# working copy's at a first vendoring, each line's fingerprint printed.
+mb=main
+if [ -f "${top}/ci/manifest" ]; then
+  # SC2016: the program is in single quotes; its $1 and $2 belong to the child.
+  # shellcheck disable=SC2016
+  mb="$("$BASH" -c '. "$1" && kit__manifest_load_text ci/manifest "$(< "$2")" && printf "%s\n" "$KIT_MAIN_BRANCH"' \
+    _ "${here}/../lib/keys.sh" "${top}/ci/manifest")" || refuse "The working copy's ci/manifest could not be read, so nothing was changed."
+fi
+signers="${tmp}/KIT-SIGNERS"
+main_blob="$(git -C "$top" rev-parse --verify -q "refs/remotes/origin/${mb}:ci/KIT-SIGNERS" 2> /dev/null)" || main_blob=""
+if [ -n "$main_blob" ]; then
+  [ "$(git -C "$top" hash-object --no-filters -- "${top}/ci/KIT-SIGNERS")" = "$main_blob" ] \
+    || refuse "ci/KIT-SIGNERS differs from ${mb}'s, so nothing was changed. Change it in a pull request of its own first."
+  git -C "$top" cat-file blob "$main_blob" > "$signers" || refuse "${mb}'s ci/KIT-SIGNERS could not be read, so nothing was changed."
+else
+  printf '%s\n' "${mb} carries no ci/KIT-SIGNERS, so this is a first vendoring: confirm each line's fingerprint below against the release signer's own ssh-keygen -lf before committing."
+  n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    case "$line" in "" | "#"*) continue ;; esac
+    read -r -a w <<< "$line"
+    for ((i = 1; i + 1 < ${#w[@]}; i++)); do
+      [[ "${w[$i]}" =~ $RE_KEYTYPE ]] || continue
+      printf '%s %s\n' "${w[$i]}" "${w[$((i + 1))]}" > "${tmp}/key.pub"
+      fp="$(ssh-keygen -l -f "${tmp}/key.pub" 2> /dev/null)" || fp="no fingerprint (the key does not parse)"
+      printf '%s\n' "ci/KIT-SIGNERS line ${n}, ${w[0]}: ${fp}"
+      break
+    done
+  done < "${top}/ci/KIT-SIGNERS"
+  signers="${top}/ci/KIT-SIGNERS"
+fi
+
+# 1. The clone, the one network act: full, so ancestry can be read.
+git clone --quiet --no-checkout --no-tags "$url" "$clone" 2> "${tmp}/err" \
+  || refuse "${url} could not be cloned, so nothing was changed."
+g() { git -C "$clone" "$@"; }
+g fetch --quiet --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}" 2> "${tmp}/err" \
+  || refuse "The tag ${tag} could not be fetched from ${url}, so nothing was changed."
+[ "$(g cat-file -t "refs/tags/${tag}" 2> /dev/null || true)" = tag ] \
+  || refuse "${tag} is not an annotated tag in ${url}, so it carries no signature and nothing was changed."
+
+# 2. The release. (a) and (b): the tag object's own headers and message.
+object="" type="" name="" header=true first="" signed=false
+while IFS= read -r line; do
+  if [ "$header" = true ]; then
+    case "$line" in
+      "") header=false; first="-" ;;
+      "object "*) object="${line#object }" ;;
+      "type "*) type="${line#type }" ;;
+      "tag "*) name="${line#tag }" ;;
+    esac
+    continue
+  fi
+  if [ "$first" = "-" ]; then first="$line"; fi
+  if [ "$line" = "-----BEGIN SSH SIGNATURE-----" ]; then signed=true; fi
+done <<< "$(g cat-file tag "refs/tags/${tag}")"
+[ "$type" = commit ] && [ "$name" = "$tag" ] \
+  || refuse "${tag} names a tag object whose own name is '${name}' and type '${type}', not ${tag} and commit, so it is not a release and nothing was changed."
+[ "$first" = "quokka-ci-kit ${tag}" ] \
+  || refuse "${tag}'s message does not begin with the line 'quokka-ci-kit ${tag}', so it is not a release and nothing was changed."
+[ "$signed" = true ] || refuse "${tag} carries no SSH signature, so nothing was changed."
+commit="$(g rev-parse --verify -q "refs/tags/${tag}^{commit}")" || commit=""
+[[ "$commit" =~ $RE_HEX ]] && [ "$commit" = "$object" ] || refuse "${tag} names no commit, so nothing was changed."
+# (c) On the kit's main.
+g rev-parse --verify -q "refs/remotes/origin/${KIT_MAIN}" > /dev/null || refuse "${url} has no ${KIT_MAIN} branch, so ${tag} cannot be placed and nothing was changed."
+g merge-base --is-ancestor "$commit" "refs/remotes/origin/${KIT_MAIN}" \
+  || refuse "${tag} names ${commit:0:12}, which is not on ${url}'s ${KIT_MAIN}, so it is not a release and nothing was changed."
+# (d) The signature: standard error alone, one anchored line.
+rc=0
+err="$(g -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" tag -v "$tag" 2>&1 > /dev/null)" || rc=$?
+signer="" n=0
+while IFS= read -r line; do
+  if [[ "$line" =~ $RE_GOOD ]]; then n=$((n + 1)); signer="${BASH_REMATCH[1]}"; fi
+done <<< "$err"
+[ "$rc" -eq 0 ] && [ "$n" -eq 1 ] || refuse "${tag} is not signed by a key that ci/KIT-SIGNERS lists, so nothing was changed."
+
+tree="$(g rev-parse --verify -q "${commit}:kit" 2> /dev/null)" || tree=""
+[[ "$tree" =~ $RE_HEX ]] || refuse "${tag} holds no kit/ tree, so nothing was changed."
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in
+    "100644 blob "* | "100755 blob "*) ;;
+    *) refuse "${tag}'s kit/ holds an entry that is not a regular file (${line#* * * }), so nothing was changed." ;;
+  esac
+done <<< "$(g ls-tree -r "$tree")"
+
+version="tag ${tag}
+commit ${commit}
+tree ${tree}
+signer ${signer}
+vendored $(date +%Y-%m-%d)"
+
+if [ "$verify_only" = true ]; then
+  printf '%s\n' "$version"
+  exit 0
+fi
+
+# 3. The tree, staged by git's own checkout, proved, then moved into place.
+stage="${tmp}/stage"
+mkdir -p "$stage"
+g --literal-pathspecs --work-tree="$stage" -c core.autocrlf=false -c core.symlinks=false checkout -q -f "$commit" -- kit 2> "${tmp}/err" \
+  || refuse "${tag}'s kit/ could not be written out, so nothing was changed."
+staged="$(cd "${stage}/kit" && GIT_INDEX_FILE="${tmp}/index" git --literal-pathspecs --git-dir="${clone}/.git" --work-tree=. -c core.autocrlf=false add -A -f . \
+  && GIT_INDEX_FILE="${tmp}/index" git --git-dir="${clone}/.git" write-tree)" || staged=""
+[ "$staged" = "$tree" ] || refuse "The kit/ written out from ${tag} hashes to ${staged:-nothing}, not ${tree}, so nothing was changed."
+
+mkdir -p "${top}/ci"
+rm -rf -- "${top}/ci/kit"
+mv "${stage}/kit" "${top}/ci/kit"
+printf '%s\n' "$version" > "${top}/ci/KIT-VERSION"
+printf '%s\n' "ci/kit is ${tag} (commit ${commit:0:12}, tree ${tree:0:12}), signed by ${signer}; ci/KIT-VERSION is written."
+
+# 4. The release's entry: from its `## <tag>` heading to the next `## `.
+notes="" in=false
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    "## ${tag}" | "## ${tag} "*) in=true ;;
+    "## "*) [ "$in" = false ] || break ;;
+  esac
+  if [ "$in" = true ]; then notes="${notes}${line}"$'\n'; fi
+done <<< "$(g show "${commit}:CHANGELOG.md" 2> /dev/null || true)"
+if [ -n "$notes" ]; then
+  printf '\n%s' "$notes"
+else
+  printf '%s\n' "${tag}'s CHANGELOG.md has no entry for it; read the release notes before the pull request."
+fi
+printf '%s\n' "Every local key moved: run the check command, then open one pull request naming ${tag}, the commit and the tree."

@@ -1,0 +1,5 @@
+node_modules/
+/web/coverage/
+/web/dist/
+/api/api
+.DS_Store

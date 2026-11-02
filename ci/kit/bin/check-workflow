@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+"""THE WORKFLOW FENCE (kit/README.md §2.3): the scheme's rules W-1 to W-12.
+
+Rewritten from the reference implementation's workflow fence:
+its scheme rules only, every name read from the manifest through the library's
+one parser (`ci/kit/bin/keys dump`, kit/README.md §3.1). The fence holds no job name of its
+own; what a job must look like follows from its manifest class and its
+`cache`, `history` and `check-name` lines. Every other rule a project wants on
+its workflows lives in the project's own fence.
+
+Read as YAML, not grepped, so a comment can neither trip nor satisfy a rule
+(a guard reads code, not prose).
+
+  W-1  The workflow's triggers are exactly pull_request (branches: [<main>],
+       types: [opened, synchronize, reopened, ready_for_review], no filter),
+       push (branches: [<main>]), schedule (one cron, `weekly-cron`) and
+       workflow_dispatch (inputs force, task with a `weekly` choice, delete);
+       no workflow in the directory carries pull_request_target or
+       workflow_run.
+  W-2  When `refuse-drafts yes`: the always-on job's first step, before any
+       checkout, refuses a draft with the kit's sentence and a non-zero exit;
+       no job's if: skips on draft.
+  W-3  The always-on job's output `sha` and the plan's CI_PLAN_SHA are the
+       head expression; every other job of the scheme (and every job a
+       `check-name` line names) checks out and records needs.<always-on>.
+       outputs.sha; no step or job env of those reads github.sha or GITHUB_SHA.
+  W-4  Every job but the always-on needs it and has an if: on a plan output;
+       a manifest job's if: is `needs.<always-on>.outputs.<job> == 'run'`,
+       success-only; every record step is if: success().
+  W-5  No workflow-level concurrency; the always-on job's group is
+       ci-<always-on>-${{ github.run_id }}, every other manifest job's is
+       ci-<job>-${{ needs.<always-on>.outputs.ref_group }}, each cancelling in
+       progress; no group in any workflow is built from the raw ref or a
+       dispatch input; the always-on job's output ref_group is the plan's.
+  W-6  The always-on job runs `bash ci/kit/bin/plan` as step `id: plan` with
+       the five CI_PLAN_* and GH_TOKEN expressions, after a checkout of the
+       head with persist-credentials: false; its permissions hold contents:
+       write and checks: read.
+  W-7  Every `local` job is exactly: the checkout, the cache runtime action by
+       sha, zero or more caches by sha (each path a kind its `cache` line
+       names; a date stamp admitted among them), the image step (optionally
+       followed by the job's own id), the verdict step, the record step; its env sets CIKIT_IMAGE_CACHE: gha; no setup-*
+       action, services:, apt-get or docker run of its own. Every `ci-only`
+       job runs `bash <adapter> <job>` once, as the step before its record
+       step, and no other step runs the adapter or the launcher. No job in any
+       workflow has a container: key.
+  W-8  Each manifest job's record step is `bash ci/kit/bin/record <job> "$KEY"
+       "$SHA"`, the last step of the job that writes it (the job itself, or
+       the job its `check-name` line names), with GITHUB_TOKEN in that step's
+       env alone; no other step in any workflow, and no code file under
+       ci/kit/ (its tests aside), the adapter or the plan extension, writes a
+       refs/ci/green/ ref or calls the record writer. The token, by any of its
+       three spellings (GITHUB_TOKEN, ${{ github.token }},
+       secrets.GITHUB_TOKEN), is in no env of a scheme job (the workflow's, the
+       job's or a step's) but the record step's GITHUB_TOKEN and the plan
+       step's GH_TOKEN.
+  W-9  Every job's name equals its id; every manifest job has a job.
+  W-10 Every `history` job's checkout carries fetch-depth: 0.
+  W-11 Every uses: in a scheme job (a manifest job, or the job a
+       `check-name` line names) names its action by a 40-hex commit sha.
+  W-12 No scheme job holds a write permission but contents: write, and that
+       only when it holds a record step; the workflow-level permissions, when
+       present, hold nothing above read.
+
+Usage:
+  check-workflow [--root DIR] [--manifest-file FILE]
+      the manifest's `workflow` under DIR (default .), the manifest from
+      `keys dump HEAD` in DIR, or from FILE (a working-tree file, read by the
+      same parser).
+  check-workflow --fixture DIR [--manifest-file FILE]
+      every *.yml in DIR against FILE (default DIR/../manifest), with no tree:
+      a file named green*.yml must have no finding, a file named
+      red-w<N>-*.yml must have at least one W-<N> finding.
+
+Exit 0 when every rule holds (or every fixture behaves); 1 on a finding; 2 when
+the fence cannot run.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("the workflow fence needs PyYAML (python3-yaml) and cannot run without it.")
+    sys.exit(2)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LIB = os.path.join(HERE, "..", "lib", "keys.sh")
+KEYS = os.path.join(HERE, "keys")
+
+# The kit's constants (kit/README.md §2.1).
+PLAN_RUN = "bash ci/kit/bin/plan"
+RECORD_BIN = "ci/kit/bin/record"
+CONTAINER_BIN = "ci/kit/bin/container"
+RUNTIME_ACTION = "crazy-max/ghaction-github-runtime"
+CACHE_ACTION = "actions/cache"
+IMAGE_CACHE_VAR = "CIKIT_IMAGE_CACHE"
+HEAD_SHA = "${{ github.event.pull_request.head.sha || github.sha }}"
+PLAN_ENV = {
+    "CI_PLAN_SHA": HEAD_SHA,
+    "CI_PLAN_EVENT": "${{ github.event_name }}",
+    "CI_PLAN_FORCE": "${{ inputs.force && 'true' || 'false' }}",
+    "CI_PLAN_TASK": "${{ inputs.task }}",
+    "CI_PLAN_REPO": "${{ github.repository }}",
+    "GH_TOKEN": "${{ github.token }}",
+}
+DRAFT_IF = "github.event_name == 'pull_request' && github.event.pull_request.draft"
+DRAFT_SENTENCE = "This pull request is a draft, so no checks ran. Mark it ready for review to run them."
+PR_TYPES = ["opened", "synchronize", "reopened", "ready_for_review"]
+TRIGGERS = {"pull_request", "push", "schedule", "workflow_dispatch"}
+DATE_STAMP = 'echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"'
+BY_SHA = re.compile(r"@[0-9a-f]{40}$")
+# What a concurrency group may not be built from: the raw ref in any spelling
+# GitHub accepts, or a dispatch input no rule has passed.
+RAW_GROUP_INPUT = re.compile(
+    r"\bgithub\s*(?:\.\s*(?:ref|ref_name|head_ref|base_ref|workflow_ref)\b"
+    r"|\[\s*'(?:ref|ref_name|head_ref|base_ref|workflow_ref)'\s*\])"
+    r"|\binputs\s*(?:\.|\[)|\bgithub\s*\.\s*event\s*\.\s*inputs\b"
+    r"|\bgithub\s*\.\s*event\s*(?:\.\s*(?:base_)?ref\b|\[\s*'(?:base_)?ref'\s*\])",
+    re.I,
+)
+# The job token in any of its three spellings, in an env value.
+TOKEN_EXPR = re.compile(
+    r"\bgithub\s*(?:\.\s*token\b|\[\s*'token'\s*\])|\bsecrets\s*(?:\.\s*GITHUB_TOKEN\b|\[\s*'GITHUB_TOKEN'\s*\])", re.I)
+RAW_SHA = re.compile(r"\bgithub\s*(?:\.\s*sha\b|\[\s*'sha'\s*\])|\bGITHUB_SHA\b", re.I)
+STATUS_FN = re.compile(r"\b(?:always|cancelled|failure|success)\s*\(", re.I)
+# A line that writes (creates or overwrites) a refs/ci/green/ ref: a push
+# whose refspec has a green destination and a source, update-ref, the git refs
+# API, mktag or tag, each on a line naming refs/ci/green/. A deletion
+# (`--delete`, an empty source) prunes; a fetch reads.
+GREEN_WRITE = re.compile(
+    r"\bgit\b[^\n]*\bpush\b[^\n]*\S:\+?refs/ci/green/|\bupdate-ref\b(?![^\n]*\s-d\b)[^\n]*refs/ci/green/"
+    r"|refs/ci/green/[^\n]*\bupdate-ref\b(?![^\n]*\s-d\b)|git/refs\b[^\n]*refs/ci/green/|refs/ci/green/[^\n]*git/refs\b"
+    r"|\bmktag\b[^\n]*refs/ci/green/|refs/ci/green/[^\n]*\bmktag\b|\"ref\"\s*:\s*\"refs/ci/green/|\bref=refs/ci/green/"
+)
+RECORD_CALL = re.compile(r"(?:ci/kit/bin/|\$here/|\$\{here\}/)record\b")
+
+
+# --- the manifest, through the one parser -------------------------------------
+
+class Manifest:
+    """The dump of a manifest (kit/README.md §3.1): singular values, the jobs, per-job words."""
+
+    def __init__(self, dump):
+        self.one = {}
+        self.jobs = []      # (name, class), in order
+        self.per = {}       # directive -> {job: [words]}
+        for line in dump.splitlines():
+            if not line:
+                continue
+            f = line.split("\t")
+            d, words = f[0], f[1:]
+            if d == "job":
+                self.jobs.append((words[0], words[1]))
+            elif d in ("paths", "check-name", "pin", "count", "install", "service", "cache", "env",
+                       "escaping-tree"):
+                self.per.setdefault(d, {}).setdefault(words[0], []).extend(words[1:])
+            elif d in ("socket", "history"):
+                for w in words:
+                    self.per.setdefault(d, {})[w] = []
+            elif d in ("not-run-allowed", "escaping-read", "escaping-scan", "pin-source", "probe"):
+                self.per.setdefault(d, {}).setdefault("*", []).append(words)
+            else:
+                self.one[d] = words
+        self.project = self.value("project")
+        self.ao = self.value("always-on")
+        self.main = self.value("main-branch")
+
+    def value(self, d):
+        return " ".join(self.one.get(d, []))
+
+    def cls(self, job):
+        return dict(self.jobs).get(job)
+
+    def names(self, cls=None):
+        return [j for j, c in self.jobs if cls is None or c == cls]
+
+    def words(self, d, job):
+        return self.per.get(d, {}).get(job, [])
+
+    def has(self, d, job):
+        return job in self.per.get(d, {})
+
+
+def dump_from_file(path):
+    script = (
+        '. "$1" || exit 2; kit__manifest_load_text "$2" "$(< "$3")" || exit 2; t=$(printf "\\t"); '
+        'for r in "${KIT__REC[@]}"; do printf "%s\\n" "${r#*"$t"}"; done'
+    )
+    run = subprocess.run(["bash", "-c", script, "fence", LIB, path, path], capture_output=True, text=True)
+    if run.returncode != 0:
+        print(f"the workflow fence could not read the manifest {path}: {run.stderr.strip()}")
+        sys.exit(2)
+    return run.stdout
+
+
+def dump_from_head(root):
+    env = dict(os.environ, KIT_KEYS_REPO=root)
+    run = subprocess.run(["bash", KEYS, "dump", "HEAD"], cwd=root, env=env, capture_output=True, text=True)
+    if run.returncode != 0:
+        print(f"the workflow fence could not read ci/manifest at HEAD: {run.stderr.strip()}")
+        sys.exit(2)
+    return run.stdout
+
+
+# --- YAML helpers ---------------------------------------------------------------
+
+def triggers(doc):
+    on = doc.get("on", doc.get(True))
+    if isinstance(on, str):
+        return {on: None}
+    if isinstance(on, list):
+        return {k: None for k in on}
+    return on or {}
+
+
+def steps(job):
+    return (job or {}).get("steps") or []
+
+
+def run_text(step):
+    return str(step.get("run") or "")
+
+
+def shell_code(run):
+    """A run: block with its whole-line shell comments blanked."""
+    return "\n".join("" if line.strip().startswith("#") else line for line in str(run or "").split("\n"))
+
+
+def bare_expr(cond):
+    """An if: with its ${{ }} wrapper and runs of whitespace removed."""
+    text = re.sub(r"\s+", " ", str(cond or "")).strip()
+    m = re.fullmatch(r"\$\{\{(.*)\}\}", text)
+    return (m.group(1) if m else text).strip()
+
+
+def success_only(cond):
+    """True when a step's if: is success() alone, or success() && a condition
+    that can add no status: no ||, no second status function."""
+    m = re.fullmatch(r"success\(\s*\)(?:\s*&&\s*(.+))?", bare_expr(cond), re.I)
+    if not m:
+        return False
+    rest = m.group(1) or ""
+    return "||" not in rest and not STATUS_FN.search(rest)
+
+
+def job_success_only(cond):
+    """A job's if: that runs only when every need succeeded: no status
+    function (which would replace the implicit success()) and no ||."""
+    text = bare_expr(cond)
+    return "||" not in text and not STATUS_FN.search(text)
+
+
+def poss(job_id):
+    """The possessive the messages use: a name ending in s takes the apostrophe alone."""
+    return job_id + ("'" if job_id.endswith("s") else "'s")
+
+
+def uses(step):
+    return str(step.get("uses") or "").split("@")[0]
+
+
+def is_checkout(step):
+    return uses(step) == "actions/checkout"
+
+
+def needs_of(job):
+    n = (job or {}).get("needs")
+    return [n] if isinstance(n, str) else (n or [])
+
+
+def label(step):
+    return step.get("name") or step.get("uses") or (step.get("run") or "").strip().split("\n")[0][:60]
+
+
+def env_of(x):
+    e = (x or {}).get("env")
+    return e if isinstance(e, dict) else {}
+
+
+def shell_strip(text):
+    """A shell file with its comments blanked: whole-line ones, and a trailing
+    ` # ...` after code."""
+    out = []
+    for line in text.split("\n"):
+        out.append("" if line.lstrip().startswith("#") else re.sub(r"\s+#\s.*$", "", line))
+    return "\n".join(out)
+
+
+# --- the rules -------------------------------------------------------------------
+
+def check(m, workflows, wf_name, root):
+    """Every finding of W-1 to W-12, as (rule, file, message)."""
+    found = []
+
+    def fail(rule, where, msg):
+        found.append((rule, where, msg))
+
+    doc = workflows[wf_name][0]
+    jobs = doc.get("jobs") or {}
+    ao, main = m.ao, m.main
+    head = HEAD_SHA
+    guards_sha = f"${{{{ needs.{ao}.outputs.sha }}}}"
+    ao_job = jobs.get(ao) or {}
+    manifest_jobs = [j for j, _c in m.jobs]
+    writer = {j: (m.words("check-name", j)[0] if m.words("check-name", j) else j) for j in manifest_jobs}
+    scheme_jobs = [j for j in manifest_jobs if j != ao]
+    sha_jobs = list(dict.fromkeys(scheme_jobs + [writer[j] for j in manifest_jobs if writer[j] != j]))
+    # The scheme's jobs: every manifest job and every job a check-name line names.
+    scheme_names = list(dict.fromkeys(manifest_jobs + [writer[j] for j in manifest_jobs]))
+
+    # --- W-1 --------------------------------------------------------------------
+    for name, (d, _raw) in workflows.items():
+        if "pull_request_target" in triggers(d):
+            fail("W-1", name, "carries a pull_request_target trigger")
+        if "workflow_run" in triggers(d):
+            fail("W-1", name, "carries a workflow_run trigger, which runs with the base's secrets on a run another workflow started")
+    on = triggers(doc)
+    if set(on) != TRIGGERS:
+        fail("W-1", wf_name, f"triggers are {sorted(on)}, not exactly pull_request, push, schedule, workflow_dispatch")
+    pr = on.get("pull_request") or {}
+    pr_types = pr.get("types") if isinstance(pr, dict) else None
+    if "pull_request" in on and (not isinstance(pr, dict) or set(pr) != {"branches", "types"}
+                                 or pr.get("branches") != [main] or not isinstance(pr_types, list)
+                                 or sorted(pr_types) != sorted(PR_TYPES) or len(pr_types) != len(PR_TYPES)):
+        fail("W-1", wf_name, f"pull_request is {pr}, not exactly {{branches: [{main}], types: [{', '.join(PR_TYPES)}]}} with no path or ignore filter")
+    if "push" in on and (on.get("push") or {}) != {"branches": [main]}:
+        fail("W-1", wf_name, f"push is {on.get('push')}, not exactly {{branches: [{main}]}}")
+    sched = on.get("schedule")
+    want_cron = m.value("weekly-cron")
+    if "schedule" in on:
+        ok = isinstance(sched, list) and len(sched) == 1 and isinstance(sched[0], dict) and set(sched[0]) == {"cron"} \
+            and re.sub(r"\s+", " ", str(sched[0]["cron"]).strip()) == want_cron
+        if not ok:
+            fail("W-1", wf_name, f"schedule is {sched}, not exactly one cron '{want_cron}' (the manifest's weekly-cron)")
+    if "workflow_dispatch" in on:
+        wd = on.get("workflow_dispatch") or {}
+        inputs = (wd.get("inputs") if isinstance(wd, dict) else None) or {}
+        for need in ("force", "task", "delete"):
+            if need not in inputs:
+                fail("W-1", wf_name, f"workflow_dispatch has no input {need}")
+        task = inputs.get("task") or {}
+        if "task" in inputs and (not isinstance(task, dict) or task.get("type") != "choice"
+                                 or "weekly" not in (task.get("options") or [])):
+            fail("W-1", wf_name, "workflow_dispatch's task input is not a choice offering weekly")
+
+    # --- W-2 --------------------------------------------------------------------
+    if m.value("refuse-drafts") == "yes":
+        st = steps(ao_job)
+        first = st[0] if st else {}
+        if bare_expr(first.get("if")) != DRAFT_IF:
+            if any(bare_expr(s.get("if")) == DRAFT_IF for s in st):
+                fail("W-2", wf_name, f"{poss(ao)} first step is not the draft refusal; it must precede the checkout")
+            else:
+                fail("W-2", wf_name, f"{poss(ao)} first step's if: is {first.get('if')!r}, not {DRAFT_IF}")
+        else:
+            code = shell_code(run_text(first))
+            if DRAFT_SENTENCE not in code:
+                fail("W-2", wf_name, f"{poss(ao)} draft step does not print \"{DRAFT_SENTENCE}\"")
+            if not re.search(r"(?m)^\s*exit\s+[1-9]\d*\s*$", code):
+                fail("W-2", wf_name, f"{poss(ao)} draft step does not exit non-zero")
+            if first.get("continue-on-error"):
+                fail("W-2", wf_name, f"{poss(ao)} draft step continues on error, so the draft would pass")
+        for job_id, job in jobs.items():
+            if re.search(r"\bdraft\b", str((job or {}).get("if", ""))):
+                fail("W-2", wf_name, f"{poss(job_id)} if: skips on draft, and a skipped job reports success")
+
+    # --- W-3 --------------------------------------------------------------------
+    if str((ao_job.get("outputs") or {}).get("sha")) != head:
+        fail("W-3", wf_name, f"{poss(ao)} output sha is {(ao_job.get('outputs') or {}).get('sha')!r}, not {head}")
+    plan_steps = [s for s in steps(ao_job) if s.get("id") == "plan"]
+    plan_sha = str(env_of(plan_steps[0]).get("CI_PLAN_SHA")) if plan_steps else None
+    if plan_sha != head:
+        fail("W-3", wf_name, f"{poss(ao)} plan CI_PLAN_SHA is {plan_sha!r}, not {head}")
+    for job_id in [ao] + sha_jobs:
+        if job_id not in jobs:
+            continue
+        job = jobs[job_id] or {}
+        want = head if job_id == ao else guards_sha
+        for st in steps(job):
+            if is_checkout(st) and job_id != ao:
+                ref = (st.get("with") or {}).get("ref")
+                if str(ref) != want:
+                    fail("W-3", wf_name, f"{poss(job_id)} checkout ref is {ref!r}, not {want}")
+            code = shell_code(run_text(st))
+            for mm in re.finditer(re.escape(RECORD_BIN) + r"\s+\S+\s+\S+\s+(\S+)", code):
+                if mm.group(1) not in ('"$SHA"', '"${SHA}"'):
+                    fail("W-3", wf_name, f"{poss(job_id)} record step '{label(st)}' records {mm.group(1)}, not \"$SHA\" from {want}")
+                elif str(env_of(st).get("SHA")) != want:
+                    fail("W-3", wf_name, f"{poss(job_id)} record step '{label(st)}' takes SHA from {env_of(st).get('SHA')!r}, not {want}")
+            text = yaml.safe_dump({k: (shell_code(v) if k == "run" else v) for k, v in st.items() if k != "name"})
+            if job_id == ao:
+                text = text.replace(head, "")
+            if RAW_SHA.search(text):
+                fail("W-3", wf_name, f"{poss(job_id)} step '{label(st)}' reads github.sha or GITHUB_SHA; the commit under test is {want}")
+        if RAW_SHA.search(yaml.safe_dump(env_of(job))):
+            fail("W-3", wf_name, f"{poss(job_id)} job env reads github.sha or GITHUB_SHA; the commit under test is {want}")
+
+    # --- W-4 --------------------------------------------------------------------
+    for job_id, job in jobs.items():
+        if job_id == ao:
+            continue
+        job = job or {}
+        if ao not in needs_of(job):
+            fail("W-4", wf_name, f"{job_id} does not need {ao}")
+        cond = bare_expr(job.get("if"))
+        if job_id in scheme_jobs:
+            plan_gate = f"needs.{ao}.outputs.{job_id} == 'run'"
+            if not re.search(r"(?:^|&&)\s*" + re.escape(plan_gate) + r"\s*(?:&&|$)", cond):
+                fail("W-4", wf_name, f"{poss(job_id)} if: is {job.get('if')!r}, which does not require {plan_gate}")
+            elif not job_success_only(job.get("if")):
+                fail("W-4", wf_name, f"{poss(job_id)} if: {job.get('if')!r} is not success-only (no status function, no ||)")
+        elif f"needs.{ao}.outputs." not in cond:
+            fail("W-4", wf_name, f"{job_id} has no if: on a plan output of {ao}")
+    for name, (d, _raw) in workflows.items():
+        for job_id, job in (d.get("jobs") or {}).items():
+            for st in steps(job):
+                if RECORD_CALL.search(shell_code(run_text(st))) and not success_only(st.get("if")):
+                    fail("W-4", name, f"{poss(job_id)} record step '{label(st)}' is not if: success() (if: {st.get('if')!r})")
+
+    # --- W-5 --------------------------------------------------------------------
+    if "concurrency" in doc:
+        fail("W-5", wf_name, "has a workflow-level concurrency group; cancellation is per job")
+    for job_id in manifest_jobs:
+        if job_id not in jobs:
+            continue
+        conc = (jobs[job_id] or {}).get("concurrency")
+        want = f"ci-{ao}-${{{{ github.run_id }}}}" if job_id == ao else f"ci-{job_id}-${{{{ needs.{ao}.outputs.ref_group }}}}"
+        if not isinstance(conc, dict) or conc.get("cancel-in-progress") is not True:
+            fail("W-5", wf_name, f"{job_id} lacks job-level concurrency with cancel-in-progress: true")
+        elif str(conc.get("group", "")) != want:
+            fail("W-5", wf_name, f"{poss(job_id)} concurrency group is {conc.get('group')!r}, not {want}")
+    for name, (d, _raw) in workflows.items():
+        scopes = [("the workflow", d.get("concurrency"))]
+        scopes += [(job_id, (job or {}).get("concurrency")) for job_id, job in (d.get("jobs") or {}).items()]
+        for scope, conc in scopes:
+            if conc is None:
+                continue
+            group = str(conc.get("group", "")) if isinstance(conc, dict) else str(conc)
+            if RAW_GROUP_INPUT.search(group):
+                fail("W-5", name, f"{scope}'s concurrency group {group!r} is built from the raw ref or a dispatch input, which GitHub folds by case; build it from the plan's ref_group")
+    if str((ao_job.get("outputs") or {}).get("ref_group")) != "${{ steps.plan.outputs.ref_group }}":
+        fail("W-5", wf_name, f"{poss(ao)} output ref_group is not ${{{{ steps.plan.outputs.ref_group }}}}")
+
+    # --- W-6 --------------------------------------------------------------------
+    st = steps(ao_job)
+    plans = [i for i, s in enumerate(st) if s.get("id") == "plan"]
+    if len(plans) != 1:
+        fail("W-6", wf_name, f"{ao} has {len(plans)} steps with id: plan, not one")
+    else:
+        p = st[plans[0]]
+        if shell_code(run_text(p)).strip() != PLAN_RUN:
+            fail("W-6", wf_name, f"{poss(ao)} plan step runs {run_text(p).strip()[:80]!r}, not exactly `{PLAN_RUN}`")
+        env = env_of(p)
+        for var, expr in PLAN_ENV.items():
+            if str(env.get(var)) != expr:
+                fail("W-6", wf_name, f"{poss(ao)} plan step sets {var} to {env.get(var)!r}, not {expr}")
+        prior = [s for s in st[:plans[0]] if is_checkout(s)]
+        if not any((s.get("with") or {}).get("persist-credentials") is False and str((s.get("with") or {}).get("ref")) == head
+                   for s in prior):
+            fail("W-6", wf_name, f"{poss(ao)} plan step does not follow a checkout of {head} with persist-credentials: false")
+    perms = ao_job.get("permissions") if isinstance(ao_job.get("permissions"), dict) else {}
+    for scope, level in (("contents", "write"), ("checks", "read")):
+        if perms.get(scope) != level:
+            fail("W-6", wf_name, f"{poss(ao)} permissions do not hold {scope}: {level}")
+
+    # --- W-7 --------------------------------------------------------------------
+    project = m.project
+    for job_id in m.names("local"):
+        if job_id not in jobs:
+            continue
+        job = jobs[job_id] or {}
+        kinds_allowed = set(m.words("cache", job_id))
+        image_steps = (f'bash {CONTAINER_BIN} image --commit "$SHA"', f'bash {CONTAINER_BIN} image --commit "$SHA" {job_id}')
+        verdict_step = f'bash {CONTAINER_BIN} run --commit "$SHA" {job_id}'
+        kinds, date_ids = [], set()
+        for s in steps(job):
+            u = uses(s)
+            code = shell_code(run_text(s)).strip()
+            if is_checkout(s):
+                kinds.append("checkout")
+                w = s.get("with") or {}
+                if w.get("persist-credentials") is not False:
+                    fail("W-7", wf_name, f"{poss(job_id)} checkout does not set persist-credentials: false")
+                depth = w.get("fetch-depth")
+                if not m.has("history", job_id) and "fetch-depth" in w and (isinstance(depth, bool) or depth != 1):
+                    fail("W-7", wf_name, f"{poss(job_id)} checkout has fetch-depth {depth!r}; a job not in `history` takes the archive at depth 1")
+            elif u == RUNTIME_ACTION:
+                kinds.append("runtime")
+                if not BY_SHA.search(str(s.get("uses"))):
+                    fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' uses {s.get('uses')}, not pinned by a 40-hex sha")
+            elif u == CACHE_ACTION:
+                kinds.append("cache")
+                if not BY_SHA.search(str(s.get("uses"))):
+                    fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' uses {s.get('uses')}, not pinned by a 40-hex sha")
+                path = str((s.get("with") or {}).get("path", "")).strip()
+                mm = re.fullmatch(r"\$\{\{\s*runner\.temp\s*\}\}/" + re.escape(project) + r"-ci-([a-z]+)", path)
+                if not mm:
+                    fail("W-7", wf_name, f"{poss(job_id)} cache step '{label(s)}' caches {path!r}, not ${{{{ runner.temp }}}}/{project}-ci-<kind>")
+                elif mm.group(1) not in kinds_allowed:
+                    fail("W-7", wf_name, f"{poss(job_id)} cache step '{label(s)}' caches {project}-ci-{mm.group(1)}, a kind no `cache {job_id}` line names")
+            elif not u and code == DATE_STAMP and s.get("id"):
+                kinds.append("cache")
+                date_ids.add(str(s.get("id")))
+            elif not u and code in image_steps:
+                kinds.append("image")
+            elif not u and code == verdict_step:
+                kinds.append("verdict")
+            elif not u and RECORD_CALL.search(code):
+                kinds.append("record")
+            else:
+                kinds.append("other")
+                fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' is not the checkout, the cache runtime, a cache, the image, the verdict or the record step")
+            if u.startswith("actions/setup-"):
+                fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' uses {u}; the toolchain is the image's")
+            if re.search(r"\bapt(?:-get)?\b", code):
+                fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' runs apt; the image installs")
+            if re.search(r"\bdocker\s+run\b", code):
+                fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' holds a docker run of its own; the launcher runs")
+            if kinds[-1] in ("image", "verdict") and str(env_of(s).get("SHA")) != guards_sha:
+                fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' takes SHA from {env_of(s).get('SHA')!r}, not {guards_sha}")
+        for date_id in sorted(date_ids):
+            ref = f"steps.{date_id}.outputs.date"
+            if not any(ref in str((s.get("with") or {}).get("key", "")) for s in steps(job) if uses(s) == CACHE_ACTION):
+                fail("W-7", wf_name, f"{poss(job_id)} date stamp step '{date_id}' feeds no cache key, so it is not a cache step")
+        if "other" not in kinds:
+            order = ["checkout", "runtime", "cache", "image", "verdict", "record"]
+            collapsed = [k for i, k in enumerate(kinds) if i == 0 or k != kinds[i - 1]]
+            once = all(kinds.count(k) == 1 for k in order if k != "cache")
+            if not once or (collapsed != order and collapsed != [k for k in order if k != "cache"]):
+                fail("W-7", wf_name, f"{poss(job_id)} steps run as {kinds}, not exactly {order} (the caches optional, every other kind once)")
+        if job.get("services"):
+            fail("W-7", wf_name, f"{job_id} has a services: block; a service is the launcher's sidecar")
+        if str(env_of(job).get(IMAGE_CACHE_VAR)) != "gha":
+            fail("W-7", wf_name, f"{poss(job_id)} job env does not set {IMAGE_CACHE_VAR}: gha")
+    adapter = m.value("adapter")
+    for job_id in m.names("ci-only"):
+        if job_id not in jobs:
+            continue
+        st = steps(jobs[job_id])
+        verdict = f"bash {adapter} {job_id}"
+        hits = [i for i, s in enumerate(st) if shell_code(run_text(s)).strip() == verdict]
+        if len(hits) != 1:
+            fail("W-7", wf_name, f"{job_id} has {len(hits)} steps running exactly `{verdict}`, not one")
+        elif hits[0] != len(st) - 2:
+            fail("W-7", wf_name, f"{poss(job_id)} verdict step `{verdict}` is not the step before its record step")
+        for i, s in enumerate(st):
+            code = shell_code(run_text(s))
+            if (hits and i == hits[0]) or not code:
+                continue
+            if adapter in code or CONTAINER_BIN in code:
+                fail("W-7", wf_name, f"{poss(job_id)} step '{label(s)}' runs the adapter or the launcher outside its one verdict step")
+    for name, (d, _raw) in workflows.items():
+        for job_id, job in (d.get("jobs") or {}).items():
+            if "container" in (job or {}):
+                fail("W-7", name, f"{job_id} has a container: key; a local job runs its image through the launcher")
+
+    # --- W-8 --------------------------------------------------------------------
+    designated = set()
+    for job_id in manifest_jobs:
+        w = writer[job_id]
+        if w not in jobs:
+            if job_id in jobs or w != job_id:
+                fail("W-8", wf_name, f"{poss(job_id)} record is written by {w}, which has no job")
+            continue
+        st = steps(jobs[w])
+        want = f'bash {RECORD_BIN} {job_id} "$KEY" "$SHA"'
+        last = st[-1] if st else {}
+        if shell_code(run_text(last)).strip() != want:
+            fail("W-8", wf_name, f"{poss(w)} last step is not `{want}`")
+            continue
+        designated.add((wf_name, w, len(st) - 1))
+        if "GITHUB_TOKEN" not in env_of(last):
+            fail("W-8", wf_name, f"{poss(w)} record step has no GITHUB_TOKEN in its env")
+    # The token in any spelling, in any env a scheme job sees, but the record
+    # step's GITHUB_TOKEN and the plan step's GH_TOKEN.
+    def token_vars(env):
+        return [k for k, v in env.items() if str(k).upper() == "GITHUB_TOKEN" or TOKEN_EXPR.search(str(v))]
+    for k in token_vars(env_of(doc)):
+        fail("W-8", wf_name, f"the workflow env {k} carries the job token to every job; only the record and plan steps take it")
+    for job_id in scheme_names:
+        if job_id not in jobs:
+            continue
+        for k in token_vars(env_of(jobs[job_id])):
+            fail("W-8", wf_name, f"{poss(job_id)} job env {k} carries the job token beyond its record step")
+        for i, s in enumerate(steps(jobs[job_id])):
+            allowed = set()
+            if (wf_name, job_id, i) in designated:
+                allowed.add("GITHUB_TOKEN")
+            if job_id == ao and s.get("id") == "plan":
+                allowed.add("GH_TOKEN")
+            for k in token_vars(env_of(s)):
+                if k not in allowed:
+                    fail("W-8", wf_name, f"{poss(job_id)} step '{label(s)}' is given the job token as {k}; only the record step's GITHUB_TOKEN and the plan's GH_TOKEN are")
+    for name, (d, _raw) in workflows.items():
+        for job_id, job in (d.get("jobs") or {}).items():
+            for i, s in enumerate(steps(job)):
+                if (name, job_id, i) in designated:
+                    continue
+                code = shell_code(run_text(s))
+                for line in code.split("\n"):
+                    if GREEN_WRITE.search(line) or RECORD_CALL.search(line):
+                        fail("W-8", name, f"{poss(job_id)} step '{label(s)}' writes a green record or calls the record writer ({line.strip()[:90]}); only a job's designated record step does")
+                        break
+    if root is not None:
+        for rel in code_files(root, m):
+            with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            code = "\n".join(re.sub(r"(^|\s)#.*$", "", ln) for ln in text.split("\n")) if is_python(text) else shell_strip(text)
+            for n, line in enumerate(code.split("\n"), 1):
+                if GREEN_WRITE.search(line) or RECORD_CALL.search(line):
+                    fail("W-8", rel, f"line {n} writes a green record or calls the record writer ({line.strip()[:90]}); only a job's record step does")
+
+    # --- W-9 --------------------------------------------------------------------
+    for job_id, job in jobs.items():
+        if str((job or {}).get("name")) != str(job_id):
+            fail("W-9", wf_name, f"{poss(job_id)} name is {(job or {}).get('name')!r}, not its id; the check run the trust test reads is the job's name")
+    for job_id in manifest_jobs:
+        if job_id not in jobs:
+            fail("W-9", wf_name, f"the manifest's job {job_id} has no job in the workflow")
+
+    # --- W-10 -------------------------------------------------------------------
+    for job_id in m.per.get("history", {}):
+        if job_id not in jobs:
+            continue
+        cos = [s for s in steps(jobs[job_id]) if is_checkout(s)]
+        if not cos:
+            fail("W-10", wf_name, f"{job_id} has no checkout")
+        for s in cos:
+            depth = (s.get("with") or {}).get("fetch-depth")
+            if isinstance(depth, bool) or depth != 0:
+                fail("W-10", wf_name, f"{poss(job_id)} checkout has fetch-depth {depth!r}, not 0; a history job takes the commit's whole ancestry")
+
+    # --- W-11 -------------------------------------------------------------------
+    for job_id in scheme_names:
+        if job_id not in jobs:
+            continue
+        job = jobs[job_id] or {}
+        refs = ([("the job", job.get("uses"))] if job.get("uses") else []) + [(label(s), s.get("uses")) for s in steps(job) if s.get("uses")]
+        for where, ref in refs:
+            if not BY_SHA.search(str(ref)):
+                fail("W-11", wf_name, f"{poss(job_id)} step '{where}' uses {ref}, not pinned by a 40-hex commit sha")
+
+    # --- W-12 -------------------------------------------------------------------
+    top = doc.get("permissions")
+    if isinstance(top, str):
+        if top.strip() != "read-all":
+            fail("W-12", wf_name, f"the workflow-level permissions are {top!r}, above read")
+    elif isinstance(top, dict):
+        for scope, level in top.items():
+            if str(level) not in ("read", "none"):
+                fail("W-12", wf_name, f"the workflow-level permissions hold {scope}: {level}, above read")
+    for job_id in scheme_names:
+        if job_id not in jobs:
+            continue
+        job = jobs[job_id] or {}
+        perms = job.get("permissions")
+        records = any(RECORD_CALL.search(shell_code(run_text(s))) for s in steps(job))
+        if isinstance(perms, str):
+            if perms.strip() != "read-all":
+                fail("W-12", wf_name, f"{poss(job_id)} permissions are {perms!r}; a scheme job writes contents at most")
+            continue
+        for scope, level in (perms or {}).items():
+            if str(level) != "write":
+                continue
+            if scope != "contents":
+                fail("W-12", wf_name, f"{poss(job_id)} permissions hold {scope}: write; a scheme job writes contents at most")
+            elif not records:
+                fail("W-12", wf_name, f"{poss(job_id)} permissions hold contents: write and it holds no record step")
+    return found
+
+
+def is_python(text):
+    return text.startswith("#!") and "python" in text.split("\n", 1)[0]
+
+
+def code_files(root, m):
+    """The code files W-8 reads: every file with a shebang under ci/kit/ but
+    its tests, the record writer and this fence (which holds the patterns as
+    data); the adapter; the plan extension."""
+    out = []
+    base = os.path.join(root, "ci", "kit")
+    skip = {os.path.join("ci", "kit", "bin", "record"), os.path.join("ci", "kit", "bin", "check-workflow")}
+    for dirpath, dirnames, filenames in os.walk(base):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == os.path.join("ci", "kit", "tests") or rel_dir.startswith(os.path.join("ci", "kit", "tests") + os.sep):
+            dirnames[:] = []
+            continue
+        for f in sorted(filenames):
+            rel = os.path.join(rel_dir, f)
+            if rel in skip:
+                continue
+            try:
+                with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+                    if not fh.read(2) == "#!":
+                        continue
+            except OSError:
+                continue
+            out.append(rel)
+    for d in ("adapter", "plan-extension"):
+        p = m.value(d)
+        if p and os.path.isfile(os.path.join(root, p)):
+            out.append(p)
+    return out
+
+
+def load_workflows(wf_dir):
+    workflows = {}
+    for name in sorted(os.listdir(wf_dir)):
+        if name.endswith((".yml", ".yaml")):
+            with open(os.path.join(wf_dir, name), encoding="utf-8") as fh:
+                raw = fh.read()
+            workflows[name] = (yaml.safe_load(raw) or {}, raw)
+    return workflows
+
+
+def report(found):
+    for rule, where, msg in found:
+        print(f"{rule} {where}: {msg}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="the kit's workflow fence, W-1 to W-12")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--manifest-file", default=None)
+    parser.add_argument("--fixture", default=None)
+    args = parser.parse_args()
+
+    if args.fixture:
+        fdir = os.path.abspath(args.fixture)
+        mfile = os.path.abspath(args.manifest_file or os.path.join(fdir, "..", "manifest"))
+        m = Manifest(dump_from_file(mfile))
+        names = sorted(n for n in os.listdir(fdir) if n.endswith((".yml", ".yaml")))
+        if not names:
+            print(f"the workflow fence found no fixture workflow in {args.fixture}, so it would prove nothing.")
+            return 2
+        bad = 0
+        for name in names:
+            with open(os.path.join(fdir, name), encoding="utf-8") as fh:
+                raw = fh.read()
+            found = check(m, {name: (yaml.safe_load(raw) or {}, raw)}, name, None)
+            red = re.match(r"red-w(\d+)-", name)
+            if name.startswith("green"):
+                ok = not found
+                verdict = "green as expected" if ok else f"NOT green: {len(found)} finding(s)"
+            elif red:
+                rule = f"W-{int(red.group(1))}"
+                ok = any(f[0] == rule for f in found)
+                verdict = f"red on {rule} as expected" if ok else f"NOT red on {rule}"
+            else:
+                print(f"{name} is neither green*.yml nor red-w<N>-*.yml, so the fence cannot say what it should find.")
+                return 2
+            print(f"{name}: {verdict}")
+            if not ok:
+                bad += 1
+                report(found)
+        print("The workflow fence's fixtures behave (W-1 to W-12; the tree-reading half of W-8 needs a tree and did not run)."
+              if not bad else f"The workflow fence's fixtures FAILED: {bad} of {len(names)} did not behave.")
+        return 1 if bad else 0
+
+    root = os.path.abspath(args.root)
+    m = Manifest(dump_from_file(os.path.abspath(args.manifest_file)) if args.manifest_file else dump_from_head(root))
+    wf = m.value("workflow")
+    wf_path = os.path.join(root, wf)
+    if not os.path.isfile(wf_path):
+        print(f"the workflow fence cannot find {wf}, the manifest's workflow.")
+        return 2
+    workflows = load_workflows(os.path.dirname(wf_path))
+    found = check(m, workflows, os.path.basename(wf_path), root)
+    if found:
+        report(found)
+        print(f"The workflow fence FAILED: {len(found)} finding(s) against the kit's scheme rules W-1 to W-12 (kit/README.md §2.3).")
+        return 1
+    print(f"OK: {wf} keeps the kit's scheme rules W-1 to W-12 for the manifest's {len(m.jobs)} jobs.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

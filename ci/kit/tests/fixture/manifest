@@ -1,0 +1,72 @@
+# The kit's fixture manifest (kit/README.md §6.1; the proofs build the
+# repository around it). Every directive of manifest v1
+# appears at least once with a value in shape, and it passes
+#   bash kit/bin/check-manifest --file kit/tests/fixture/manifest --no-vendor-check
+# The digest below is a fixed fixture value, not a real image.
+manifest v1
+project kitfix
+key-epoch 1
+local-epoch 1
+main-branch main
+workflow .github/workflows/ci.yml
+always-on gate
+adapter ci/adapter.sh
+kit-job kitself
+plan-extension ci/plan-extension.sh
+signers ci/allowed-signers
+check-command make check
+weekly-cron 40 5 * * 1
+prune-days 30
+prune-keep-green gate alpha delta kitself
+lock-wait-minutes 30
+refuse-drafts yes
+image ci/image/Dockerfile
+image-path ci/image tools.sh src/go.mod
+user 1001
+
+job gate always-on
+job alpha local
+job delta local
+job beta ci-only
+job gamma content
+job kitself local
+paths gate .
+paths alpha src deploy/tool.sh Makefile .github/workflows/ci.yml ci tools.sh
+paths delta deploy .githooks Makefile ci tools.sh src/go.mod
+paths beta obs ci
+paths gamma obs .github/workflows/ci.yml
+paths kitself ci
+check-name gamma gammarecord
+pin alpha go node
+pin delta shellcheck python
+count alpha unit_tests integration_tests
+count delta harnesses
+count beta harnesses
+count kitself kit_cases
+install alpha npm-ci src/web
+service alpha postgres image postgres:18@sha256:dc471c6bc35332c2bd1262259d3ca255bc2d41374e057c62f72b23da5a7b318a url-env KITFIX_TEST_PG_URL flag fsync=off flag max_connections=300
+socket delta
+history delta
+cache alpha gomod gobuild npm
+cache delta gomod
+env alpha GO_TEST_COUNT
+escaping-tree alpha src
+escaping-tree delta deploy
+escaping-tree beta obs
+escaping-scan go src
+escaping-scan ts src/web
+
+pin-source go toolchain-line src/go.mod
+pin-source node first-line src/web/.nvmrc
+pin-source * readonly-version tools.sh
+probe go first-line go env GOVERSION
+probe node first-line in src/web node --version
+probe shellcheck after-word version: shellcheck --version
+probe python python-minor python3
+not-run-allowed tests/run:bash32 a platform leg that needs a bash 3.2 the host lacks (fixture criterion F-2)
+not-run-allowed tests/run:bash4 a platform leg that needs a bash 4.2 the host lacks (fixture criterion F-3)
+not-run-allowed tests/run:pyyaml a platform leg that needs PyYAML the host lacks (fixture criterion F-4)
+not-run-allowed tests/run:docker-leg the image build leg, which needs a Docker daemon (fixture criterion F-1)
+escaping-read alpha|src/a/a_test.go|deploy/tool.sh|reads the deploy helper it wraps
+escaping-read alpha|src/web/x.test.ts|NONE|computes a repository-relative name for its report
+escaping-read beta|obs/harness_test.go|WHOLE-TREE|walks the whole checkout by design

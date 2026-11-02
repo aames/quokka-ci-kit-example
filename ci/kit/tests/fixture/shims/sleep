@@ -1,0 +1,5 @@
+#!/bin/sh
+# THE sleep SHIM: for K-record it logs its argument and waits for nothing;
+# anywhere else (no SLEEP_LOG) it is the real sleep.
+if [ -z "${SLEEP_LOG:-}" ]; then exec /bin/sleep "$@"; fi
+printf '%s\n' "$*" >> "$SLEEP_LOG"

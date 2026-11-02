@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""THE KIT'S FENCE ON ITS OWN HOST FILES (kit/README.md §2.2).
+
+The host side of the kit (the library's host-reached functions, the keys and
+manifest commands, the driver, the hook and its shim, the launcher,
+kit-update, check-prereqs) runs under the macOS /bin/bash 3.2 and calls only
+the host allow-list: git, docker, mkdir, mv, rm, mktemp, cat, date, uname,
+sleep, kill, tail, head, tr, wc, shasum, sha256sum (kit/README.md §2.2), and
+ssh-keygen, the host prerequisite that section names. Two files carry more, each by
+its own text: kit/lib/keys.sh's host-reached functions also call awk and cut
+(the list its header names), and the hook's shim runs `bash`.
+
+  1. No external command outside that list in command position. Comments,
+     heredoc bodies, single-quoted literals (the awk programs, the in-image
+     reader handed to docker run) and double-quoted text are not read; a
+     command named by a variable ("$BASH") is not a word here.
+  2. No bash 4 construct anywhere in the file: declare -A, mapfile, readarray,
+     ${x,,}, ${x^^}, [[ -v.
+
+In kit/lib/keys.sh rule 1 reads only the functions its header names as
+host-reached (the list after "The functions the host reaches") and every
+function of the file they call; the trust functions run on the runner and
+are not held to it. Rule 2 reads the whole file.
+
+The shell scanner is lifted from the reference implementation's workflow
+fence: a reader of command positions, not a parser.
+
+Usage: check-host <dir>, where <dir> holds the kit tree (kit/ in the kit's
+repository, ci/kit/ in an adopter). A host file absent from <dir> is named and
+not checked; a <dir> holding none of them is refused. Exit 0 clean; 1 on a
+finding; 2 when the fence cannot run.
+"""
+
+import os
+import re
+import sys
+
+HOST_ALLOWED = {"git", "docker", "mkdir", "mv", "rm", "mktemp", "cat", "date", "uname", "sleep", "kill",
+                "tail", "head", "tr", "wc", "shasum", "sha256sum", "ssh-keygen"}
+HOST_FILES = ("lib/keys.sh", "bin/keys", "bin/local-ci", "bin/pre-push", "bin/container", "bin/kit-update",
+              "bin/check-manifest", "bin/check-prereqs", "hooks/pre-push.shim")
+EXTRA = {"lib/keys.sh": {"awk", "cut"}, "hooks/pre-push.shim": {"bash"}}
+BASH4_ONLY = (
+    (re.compile(r"\bdeclare\s+-[A-Za-z]*A"), "declare -A"),
+    (re.compile(r"\bmapfile\b"), "mapfile"),
+    (re.compile(r"\breadarray\b"), "readarray"),
+    (re.compile(r"\$\{[^}]*,,[^}]*\}"), "${...,,}"),
+    (re.compile(r"\$\{[^}]*\^\^[^}]*\}"), "${...^^}"),
+    (re.compile(r"\[\[\s+-v\b"), "[[ -v"),
+)
+
+SHELL_BUILTINS = {
+    ".", ":", "[", "alias", "bg", "bind", "break", "builtin", "caller", "cd", "command", "compgen", "complete",
+    "continue", "declare", "dirs", "disown", "echo", "enable", "eval", "exec", "exit", "export", "false", "fc",
+    "fg", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "logout", "popd", "printf",
+    "pushd", "pwd", "read", "readonly", "return", "set", "shift", "shopt", "source", "suspend", "test",
+    "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "wait",
+}
+LEADS_A_COMMAND = {"if", "then", "else", "elif", "do", "while", "until", "!", "time", "exec"}
+ENDS_A_COMMAND = {"for", "select", "case", "function", "in", "esac", "done", "fi", "[[", "]]", "}", "{"}
+BASH4_ONLY = (
+    (re.compile(r"\bdeclare\s+-[A-Za-z]*A"), "declare -A"),
+    (re.compile(r"\bmapfile\b"), "mapfile"),
+    (re.compile(r"\breadarray\b"), "readarray"),
+    (re.compile(r"\$\{[^}]*,,[^}]*\}"), "${...,,}"),
+    (re.compile(r"\$\{[^}]*\^\^[^}]*\}"), "${...^^}"),
+    (re.compile(r"\[\[\s+-v\b"), "[[ -v"),
+)
+
+
+def shell_scan(s, blank_dq=True):
+    """Shell text with comments and heredoc bodies dropped and every single-
+    quoted literal blanked to '_'; with blank_dq, double-quoted text is blanked
+    too, keeping the command substitutions inside it as code. Arithmetic
+    $(( )) and (( )) is blanked. A reader of command positions, not a parser."""
+    out, _ = _scan(s, 0, False, blank_dq)
+    return out
+
+
+def _nl(text):
+    """A blank that keeps the text's newlines, so line numbers hold."""
+    return "_" + "\n" * text.count("\n")
+
+
+def _scan(s, i, nested, blank_dq):
+    out, depth, heredocs = [], 0, []
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append("'" + _nl(s[i + 1:j]) + "'")
+            i = j + 1
+            continue
+        if c == '"':
+            sub, i = _scan_dq(s, i + 1, blank_dq)
+            out.append('"' + sub + '"')
+            continue
+        if c == "#" and (i == 0 or s[i - 1] in " \t\n;|&()"):
+            while i < n and s[i] != "\n":
+                i += 1
+            continue
+        if s.startswith("$((", i) or (s.startswith("((", i) and (i == 0 or s[i - 1] in " \t\n;|&")):
+            j = s.find("))", i)
+            j = n if j < 0 else j
+            out.append(_nl(s[i:j]))
+            i = j + 2
+            continue
+        if s.startswith("$(", i):
+            sub, i = _scan(s, i + 2, True, blank_dq)
+            out.append("$(" + sub + ")")
+            continue
+        if c == "`":
+            j = s.find("`", i + 1)
+            j = n if j < 0 else j
+            sub, _ = _scan(s[i + 1:j], 0, False, blank_dq)
+            out.append("$(" + sub + ")")
+            i = j + 1
+            continue
+        if s.startswith("<<", i) and not s.startswith("<<<", i):
+            m = re.match(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", s[i:])
+            if m:
+                heredocs.append(m.group(2))
+                out.append("<<_")
+                i += m.end()
+                continue
+        if c == "\n" and heredocs:
+            out.append("\n")
+            i += 1
+            for word in heredocs:
+                while i < n:
+                    j = s.find("\n", i)
+                    j = n if j < 0 else j
+                    line = s[i:j]
+                    i = j + 1
+                    out.append("\n")
+                    if line.strip() == word:
+                        break
+            heredocs = []
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if nested and depth == 0:
+                return "".join(out), i + 1
+            depth -= 1
+        out.append(c)
+        i += 1
+    return "".join(out), i
+
+
+def _scan_dq(s, i, blank_dq):
+    out, n = [], len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            out.append(_nl(s[i:i + 2]) if blank_dq else s[i:i + 2])
+            i += 2
+            continue
+        if c == '"':
+            return "".join(out), i + 1
+        if s.startswith("$((", i):
+            j = s.find("))", i)
+            j = n if j < 0 else j
+            out.append(_nl(s[i:j]) if blank_dq else s[i:j + 2])
+            i = j + 2
+            continue
+        if s.startswith("$(", i):
+            sub, i = _scan(s, i + 2, True, blank_dq)
+            out.append("$(" + sub + ")")
+            continue
+        if c == "`":
+            j = s.find("`", i + 1)
+            j = n if j < 0 else j
+            sub, _ = _scan(s[i + 1:j], 0, False, blank_dq)
+            out.append("$(" + sub + ")")
+            i = j + 1
+            continue
+        out.append(("\n" if c == "\n" else "_") if blank_dq else c)
+        i += 1
+    return "".join(out), i
+
+
+def _drop_case_patterns(text):
+    """The text with each case pattern (after `in`, `;;`, `;&` or `;;&`, up to
+    its `)`) blanked, so `backend | frontend)` reads as no command."""
+    out, pos = [], 0
+    starts = []
+    stack = 0
+    for m in re.finditer(r"\bcase\b|\besac\b|;;&|;;|;&", text):
+        word = m.group(0)
+        if word == "case":
+            m_in = re.compile(r"\bin\b").search(text, m.end())
+            if m_in:
+                stack += 1
+                starts.append(m_in.end())
+        elif word == "esac":
+            stack = max(0, stack - 1)
+        elif stack:
+            starts.append(m.end())
+    for start in sorted(set(starts)):
+        if start < pos:
+            continue
+        if re.match(r"\s*esac\b", text[start:]):
+            continue
+        pm = re.match(r"\s*\(?[^()]*?\)", text[start:])
+        if not pm:
+            continue
+        out.append(text[pos:start])
+        out.append(re.sub(r"[^\n]", " ", text[start:start + pm.end()]))
+        pos = start + pm.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def host_commands(text, known=()):
+    """(line, word) for each word in command position of a bash file that is
+    neither a builtin, a keyword nor one of the file's functions: the external
+    commands it runs. Comments, string literals and case patterns are not read;
+    a command named by a variable ("$BASH") is not a word here."""
+    funcs = set(re.findall(r"(?m)^\s*(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\)", text)) | set(known)
+    code = shell_scan(text)
+    code = re.sub(r"\[\[(?:(?!\]\]|\$\().)*\]\]", "[[ _ ]]", code)
+    prev = None
+    while prev != code:
+        prev = code
+        code = re.sub(r"\$\{[^{}]*\}", lambda m: _nl(m.group(0)), code)
+    code = _drop_case_patterns(code)
+    # An array literal, name=(...) or name+=(...), holds words, not commands.
+    code = re.sub(r"(\+?=)\(([^()]*)\)", lambda m: m.group(1) + " " + _nl(m.group(2)) + " ", code)
+    found = []
+    line_starts = [0] + [m.end() for m in re.finditer(r"\n", code)]
+
+    def line_of(pos):
+        lo = 0
+        for k, st in enumerate(line_starts):
+            if st > pos:
+                break
+            lo = k
+        return lo + 1
+
+    # A backslash-newline continues the command: folded, positions kept.
+    code = code.replace("\\\n", "  ")
+    sep = re.compile(r"\|\||&&|;;&|;;|;&|[;&|\n()]|(?:(?<=\s)|^)[{}](?=\s|$)", re.M)
+    pos = 0
+    pieces = []
+    for m in sep.finditer(code):
+        pieces.append((pos, code[pos:m.start()]))
+        pos = m.end()
+    pieces.append((pos, code[pos:]))
+    for start, seg in pieces:
+        words = seg.split()
+        k = 0
+        while k < len(words):
+            w = words[k]
+            if re.match(r"^[A-Za-z_]\w*(\[[^]]*\])?\+?=", w):
+                k += 1
+                continue
+            if re.match(r"^\d*(?:<<<|<<|>>|<>|>&|<&|>|<)", w):
+                k += 1 if re.match(r"^\d*(?:<<<|<<|>>|<>|>&|<&|>|<)\S", w) else 2
+                continue
+            if w in LEADS_A_COMMAND:
+                k += 1
+                continue
+            if w == "command":
+                if k + 1 < len(words) and words[k + 1].startswith("-"):
+                    break
+                k += 1
+                continue
+            if w in ENDS_A_COMMAND or w in SHELL_BUILTINS or w in funcs:
+                break
+            if re.match(r"^[A-Za-z][A-Za-z0-9._+-]*$", w) or re.match(r"^\.?\.?/[^\s'\"$]+$", w):
+                found.append((line_of(start), w))
+            break
+    return found
+
+
+def literals_stripped(text):
+    """A bash file with comments dropped and single-quoted literals blanked
+    (the in-container reader, a `bash -c` program), double quotes kept."""
+    return shell_scan(text, blank_dq=False)
+
+
+FUNC_DEF = re.compile(r"(?m)^([A-Za-z_][\w-]*)\(\)\s*([({])\s*$")
+FUNC_ONE_LINE = re.compile(r"(?m)^([A-Za-z_][\w-]*)\(\)\s*\{.*\}\s*$")
+
+
+def functions(text):
+    """name -> (start, end) offsets of each column-0 function: `name() {` to a
+    column-0 `}`, `name() (` to a column-0 `)`, or `name() { ...; }` on one
+    line."""
+    out = {}
+    for m in FUNC_ONE_LINE.finditer(text):
+        out[m.group(1)] = (m.start(), m.end())
+    for m in FUNC_DEF.finditer(text):
+        close = "}" if m.group(2) == "{" else ")"
+        end = re.compile(r"(?m)^" + re.escape(close) + r"\s*$").search(text, m.end())
+        out[m.group(1)] = (m.start(), end.end() if end else len(text))
+    return out
+
+
+def host_reached(text):
+    """The function names a library header lists after "The functions the
+    host reaches", up to the sentence that names the tools."""
+    m = re.search(r"The functions the host reaches[^\n]*\n((?:#[^\n]*\n)+?)#\s*and call only", text)
+    if not m:
+        return None
+    return re.findall(r"\b(kit_[a-z_]+)\b", m.group(1))
+
+
+def masked_to(text, spans):
+    """The text with every character outside the spans blanked, newlines kept."""
+    keep = [False] * len(text)
+    for a, b in spans:
+        for k in range(a, b):
+            keep[k] = True
+    return "".join(c if keep[i] or c == "\n" else " " for i, c in enumerate(text))
+
+
+def library_reach(text):
+    """(every function of the library, the host-reached closure, findings)."""
+    funcs = functions(text)
+    roots = host_reached(text)
+    if not roots:
+        return funcs, set(), ["lib/keys.sh: its header names no host-reached functions ('The functions the host "
+                              "reaches ...'), so the fence cannot tell which code the host runs"]
+    found = []
+    missing = [f for f in roots if f not in funcs]
+    if missing:
+        found.append(f"lib/keys.sh: its header names {', '.join(missing)} as host-reached, which the file does not define")
+    reach, todo = set(), [f for f in roots if f in funcs]
+    while todo:
+        f = todo.pop()
+        if f in reach:
+            continue
+        reach.add(f)
+        a, b = funcs[f]
+        body = shell_scan(text[a:b])
+        for g in funcs:
+            if g not in reach and re.search(r"(?<![\w-])" + re.escape(g) + r"(?![\w-])", body):
+                todo.append(g)
+    return funcs, reach, found
+
+
+def check_file(rel, text, lib_funcs, reach):
+    """Rule 1 over the host code of one file, rule 2 over all of it. A call to
+    a library function is a call into the host-reached closure, or a finding."""
+    found = []
+    allowed = HOST_ALLOWED | EXTRA.get(rel, set())
+    scan = text
+    if rel == "lib/keys.sh":
+        scan = masked_to(text, [lib_funcs[f] for f in reach])
+    for n, word in host_commands(scan, reach):
+        if word in lib_funcs:
+            found.append(f"{rel} line {n} calls the library's {word}, which runs on the runner only (lib/keys.sh's header does not name it host-reached, nor does a host-reached function call it)")
+        elif os.path.basename(word) not in allowed or "/" in word:
+            found.append(f"{rel} line {n} runs {word}, which is not in the host allow-list ({', '.join(sorted(allowed))})")
+    bare = literals_stripped(text)
+    for n, line in enumerate(bare.split("\n"), 1):
+        for pattern, what in BASH4_ONLY:
+            if pattern.search(line):
+                found.append(f"{rel} line {n} uses {what}, which the host's bash 3.2 does not have ({line.strip()[:80]})")
+    return found
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: check-host <dir>")
+        return 2
+    base = argv[1]
+    if not os.path.isdir(base):
+        print(f"check-host: {base} is not a directory.")
+        return 2
+    found, checked = [], 0
+    lib_funcs, reach = {}, set()
+    lib = os.path.join(base, "lib", "keys.sh")
+    if os.path.isfile(lib):
+        with open(lib, encoding="utf-8") as fh:
+            lib_funcs, reach, found = library_reach(fh.read())
+    for rel in HOST_FILES:
+        path = os.path.join(base, rel)
+        if not os.path.isfile(path):
+            print(f"{rel} is not in {base}, so it was not checked.")
+            continue
+        with open(path, encoding="utf-8") as fh:
+            found += check_file(rel, fh.read(), lib_funcs, reach)
+        checked += 1
+    if checked == 0:
+        print(f"check-host found none of the kit's host files in {base}, so it would prove nothing.")
+        return 2
+    if found:
+        print("\n".join(found))
+        print(f"The host fence FAILED: {len(found)} finding(s) in {checked} host file(s).")
+        return 1
+    print(f"OK: {checked} host file(s) call only the host allow-list and use no bash 4 construct.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
