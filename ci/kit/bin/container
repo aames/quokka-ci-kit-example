@@ -1,0 +1,701 @@
+#!/usr/bin/env bash
+#
+# THE LAUNCHER OF THE JOB IMAGES (kit/README.md §2.2, §2.1, §3.3, §3.5, §3.2).
+# Derived from the author's private reference implementation. One launcher,
+# one set of flags, on the workstation and on the runner.
+#
+#   ci/kit/bin/container image --commit <rev> [<job>]
+#   ci/kit/bin/container run [--run-id <id>] --commit <rev> <job>
+#   ci/kit/bin/container versions --commit <rev> <job>...
+#
+# Every list it acts on is the COMMIT's ci/manifest, read once as the dump of
+# the commit's own ci/kit/lib/keys.sh in a child under "$BASH" (keys_call),
+# never sourced here. <job> is a `local` job of that manifest; the kit job
+# (`kit-job`) is one.
+#
+# TWO IMAGES, TWO KEYS (kit/README.md §3.2). The base, <project>-ci-base:<base key>, is
+# ci/kit/image/base.Dockerfile built from `git archive <commit> --
+# ci/kit/image` alone, the key `kit_key <commit> base`, with the build
+# argument CIKIT_UID from the manifest's `user`. The job image,
+# <project>-ci-job:<image key>, is the manifest's `image` Dockerfile built
+# from `git archive <commit> -- <image-path>...` FROM the base by the build
+# argument CIKIT_BASE, the key `kit_key <commit> image`. A change under the
+# image-path PATHs rebuilds the job image and not the base. Both builds take
+# the label io.github.aames.quokka-ci-kit.image-key=<their key> from this
+# launcher, and a found image and a built one are both checked by it: an accident check,
+# since any Docker client can tag an image under a key it computes. Built for
+# this machine's architecture, never under emulation and never pulled.
+# With CIKIT_IMAGE_CACHE=gha the builds read and write the Actions cache
+# through the docker-container builder <project>-ci-gha (BuildKit pinned by
+# digest below), the base handed to the job build as an OCI layout pinned by
+# its one manifest digest, scopes <project>-ci-job-base and <project>-ci-job;
+# otherwise Docker's own layer cache serves. After a build the older tags of
+# the two repositories beyond the three newest of each are removed.
+#
+# image: finds or builds the job image, or for the kit job the base alone,
+# and prints `<repository>:<key> <image id>` on stdout (all else to stderr).
+#
+# run: one job in its image. The commit's archive goes in on the container's
+# stdin with CIKIT_TREE; for a `history` job a pack of the commit and its
+# whole ancestry instead, made from the commit's id so no ref is written
+# here, with CIKIT_COMMIT, and a shallow clone refused before any container.
+# The image's cikit-enter checks the hashes, runs the job's `install` and
+# then the verdict, CIKIT_ADAPTER: the manifest's `adapter`, or
+# ci/kit/tests/run for the kit job. Per job, from the manifest:
+#   service  a sidecar <project>-check-<kind>-<run id> on the network
+#            <project>-ci-<run id>, published nowhere, its URL in `url-env`;
+#            when the job fails, its last 200 log lines; removed on every exit
+#   socket   the Docker socket with --group-add of its group, --network host
+#   neither  the default bridge
+#   cache    named volumes <project>-ci-<kind> on the workstation, the
+#            directories $RUNNER_TEMP/<project>-ci-<kind> in CI
+#   env      each named host variable passed when set, empty included
+# Every run: --rm, --user <user>:<user>, --security-opt no-new-privileges,
+# --cap-drop ALL (also on the reader and the socket-group probe; never on the
+# service sidecar), the name <project>-ci-<job>-<run id>,
+# an environment by an allow-list of names (CIKIT_TREE, CIKIT_JOB,
+# CIKIT_PROJECT, CIKIT_ADAPTER, CIKIT_INSTALL, CIKIT_COMMIT, the service's
+# url-env, the `env` names, GITHUB_ACTIONS in CI, and with it the constant
+# CI=true). No SSH agent, no home directory, no part of the clone; never
+# --privileged, never --pid. The run id is --run-id, else
+# $GITHUB_RUN_ID-$GITHUB_JOB in CI, else this pid. The trap removes the job
+# container, the sidecar with its anonymous volume, the network and this
+# script's temporary files on every exit, SIGINT included.
+#
+# versions: the reader, run once in one container with no network, prints
+# `<tool> <version>` per pinned tool of the named jobs. The reader is TEXT
+# held here (a bash loop and one awk program); the `probe` lines are passed
+# to it as arguments, never as code: each BINARY runs as an argument vector,
+# stdout alone is read, and no regular expression or shell text comes from
+# the manifest (kit/README.md §3.4, §3.8). A probe with `in DIR` reads that directory of
+# the commit, streamed in. The comparison with the pins is the caller's.
+#
+# THE HOST HALF RUNS UNDER BASH 3.2: no declare -A, mapfile, readarray,
+# case-changing expansions, [[ -v ]], wait -n, negative subscripts or coproc.
+# Its external commands are git, docker, mkdir, rm, mktemp and sleep, inside
+# the host allow-list; no host tool parses any output (bash's own [[ =~ ]],
+# case and read do).
+#
+# EXIT: the job's status for run; 0 for image and versions; 2 a refusal.
+set -euo pipefail
+
+readonly CIKIT_LABEL=io.github.aames.quokka-ci-kit.image-key
+readonly CIKIT_ENTRY=cikit-enter
+readonly CIKIT_KIT_VERDICT=ci/kit/tests/run
+readonly CI_HOME=/home/ci
+readonly CI_SOCKET=/var/run/docker.sock
+readonly RE_LAYOUT_DIGEST='"digest"[[:space:]]*:[[:space:]]*"(sha256:[0-9a-f]{64})"'
+readonly RE_NAME='^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+readonly RE_KEY='^[0-9a-f]{64}$'
+readonly RE_ID='^sha256:[0-9a-f]{64}$'
+# The gha builder's BuildKit, moby/buildkit v0.34.0's index (released
+# 2026-10-07), pinned by digest. A bump is a reviewed edit of the line, a
+# digest at least two weeks old, and a PATCH release.
+readonly CI_BUILDKIT_IMAGE=moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+readonly CI_KEEP_IMAGES=3
+readonly CI_SERVICE_LOG_LINES=200
+# The hardening every container of a job's image takes: the job run, the
+# reader and the socket-group probe, socket jobs included; the service
+# sidecar alone runs without it, its image's own entry needing root to start.
+HARDEN=(--security-opt no-new-privileges --cap-drop ALL)
+
+say() { printf '%s\n' "$*" >&2; }
+refuse() { printf '%s\n' "$1" >&2; exit 2; }
+usage() {
+  refuse "usage: container image --commit <rev> [<job>] | run [--run-id <id>] --commit <rev> <job> | versions --commit <rev> <job>..."
+}
+
+# --- arguments -----------------------------------------------------------------------
+
+cmd="${1:-}"
+[ -n "$cmd" ] || usage
+shift
+rev="" run_id="" jobs=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --commit) [ "$#" -ge 2 ] || usage; rev="$2"; shift 2 ;;
+    --run-id) [ "$cmd" = run ] && [ "$#" -ge 2 ] || usage; run_id="$2"; shift 2 ;;
+    -*) usage ;;
+    *)
+      [[ "$1" =~ $RE_NAME ]] || refuse "$1 is not a job name, so nothing ran."
+      jobs+=("$1")
+      shift
+      ;;
+  esac
+done
+[ -n "$rev" ] || usage
+case "$cmd" in
+  image) [ "${#jobs[@]}" -le 1 ] || usage ;;
+  run) [ "${#jobs[@]}" -eq 1 ] || usage ;;
+  versions) [ "${#jobs[@]}" -ge 1 ] || usage ;;
+  *) usage ;;
+esac
+
+sha="$(git rev-parse --verify -q "${rev}^{commit}")" || refuse "${rev} is not a commit here, so nothing ran."
+git cat-file -e "${sha}:ci/kit/lib/keys.sh" 2> /dev/null || refuse "${sha:0:8} predates the kit, so nothing ran."
+
+# --- cleanup -------------------------------------------------------------------------
+
+tmp_files=() tmp_dirs=()
+job_container="" svc_container="" network=""
+cleanup() {
+  local f
+  # -v: the sidecar's anonymous data volume goes with it; named cache
+  # volumes are never anonymous and survive.
+  if [ -n "$job_container" ]; then docker rm -f -v "$job_container" > /dev/null 2>&1 || true; fi
+  if [ -n "$svc_container" ]; then docker rm -f -v "$svc_container" > /dev/null 2>&1 || true; fi
+  if [ -n "$network" ]; then docker network rm "$network" > /dev/null 2>&1 || true; fi
+  for f in ${tmp_files[@]+"${tmp_files[@]}"}; do rm -f -- "$f"; done
+  for f in ${tmp_dirs[@]+"${tmp_dirs[@]}"}; do rm -rf -- "$f"; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# keys_call <function> [<arg>...]: runs <function> from the commit's
+# ci/kit/lib/keys.sh in a child bash and prints what it prints. Called inside
+# $(...), whose additions to tmp_files never reach the trap, so it removes
+# its own file. Named for its prefix only after the manifest is read.
+keys_file_prefix="${TMPDIR:-/tmp}/cikit-keys"
+keys_call() {
+  local rc=0 file
+  file="$(mktemp "${keys_file_prefix}.XXXXXX")" || return 1
+  git show "${sha}:ci/kit/lib/keys.sh" > "$file" 2> /dev/null || { rm -f -- "$file"; return 1; }
+  # SC2016: the program is in single quotes; its $1 and $@ belong to the child.
+  # shellcheck disable=SC2016
+  "$BASH" -c '. "$1"; shift; "$@"' _ "$file" "$@" || rc=$?
+  rm -f -- "$file"
+  return "$rc"
+}
+
+# --- the commit's manifest, read once -----------------------------------------------
+#
+# The dump is one line per directive, `<directive>\t<word>...`. m_dir[i] is a
+# line's directive and m_arg[i] the rest, tab-separated.
+m_dir=() m_arg=()
+dump="$(keys_call kit_manifest_dump "$sha")" || refuse "The ci/manifest of ${sha:0:8} could not be read, so nothing ran."
+tab=$'\t'
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  m_dir+=("${line%%"$tab"*}")
+  case "$line" in *"$tab"*) m_arg+=("${line#*"$tab"}") ;; *) m_arg+=("") ;; esac
+done <<< "$dump"
+
+# m_one <directive>: the words of the first line of <directive>, space separated.
+m_one() {
+  local i
+  for i in "${!m_dir[@]}"; do
+    if [ "${m_dir[$i]}" = "$1" ]; then printf '%s\n' "${m_arg[$i]//"$tab"/ }"; return 0; fi
+  done
+  return 0
+}
+# m_job <directive> <job>: the words after <job> of every <directive> line naming it.
+m_job() {
+  local i out="" a
+  for i in "${!m_dir[@]}"; do
+    [ "${m_dir[$i]}" = "$1" ] || continue
+    a="${m_arg[$i]}"
+    case "$a" in "$2$tab"*) a="${a#"$2$tab"}"; out="${out:+$out }${a//"$tab"/ }" ;; esac
+  done
+  printf '%s\n' "$out"
+}
+# m_lists <directive> <job>: 0 when a list line of <directive> names <job>.
+m_lists() {
+  local i
+  for i in "${!m_dir[@]}"; do
+    [ "${m_dir[$i]}" = "$1" ] || continue
+    case "$tab${m_arg[$i]}$tab" in *"$tab$2$tab"*) return 0 ;; esac
+  done
+  return 1
+}
+# m_class <job>: the job's class, or nothing.
+m_class() {
+  local i
+  for i in "${!m_dir[@]}"; do
+    if [ "${m_dir[$i]}" = job ] && [ "${m_arg[$i]%%"$tab"*}" = "$1" ]; then printf '%s\n' "${m_arg[$i]#*"$tab"}"; return 0; fi
+  done
+  return 0
+}
+
+project="$(m_one project)"
+[[ "$project" =~ ^[a-z][a-z0-9]{1,15}$ ]] || refuse "The ci/manifest of ${sha:0:8} names no project, so nothing ran."
+kit_job="$(m_one kit-job)"
+adapter="$(m_one adapter)"
+image_file="$(m_one image)"
+user="$(m_one user)"
+user="${user:-1001}"
+read -r -a image_paths <<< "$(m_one image-path)"
+readonly IMAGE_REPO="${project}-ci-job" BASE_REPO="${project}-ci-base"
+readonly GHA_BUILDER="${project}-ci-gha" GHA_SCOPE="${project}-ci-job" BASE_CONTEXT="${project}-ci-base"
+keys_file_prefix="${TMPDIR:-/tmp}/${project}-ci-keys"
+
+for job in ${jobs[@]+"${jobs[@]}"}; do
+  [ "$(m_class "$job")" = local ] || refuse "${job} is not a local job of ${sha:0:8}'s ci/manifest, so nothing ran."
+done
+
+# temp_file and temp_dir: a new temporary path this run removes on exit, in $made.
+made=""
+temp_file() {
+  made="$(mktemp "${TMPDIR:-/tmp}/${project}-ci-container.XXXXXX")" || refuse "No temporary file could be made, so nothing ran."
+  tmp_files+=("$made")
+}
+temp_dir() {
+  made="$(mktemp -d "${TMPDIR:-/tmp}/${project}-ci-container.XXXXXX")" || refuse "No temporary directory could be made, so nothing ran."
+  tmp_dirs+=("$made")
+}
+
+# --- images ----------------------------------------------------------------------------
+
+base_key="" base_tag="" base_id="" image_key="" image_tag="" image_id="" built=false
+
+# key_of <base|image>: the key, by the commit's library.
+key_of() {
+  local k
+  k="$(keys_call kit_key "$sha" "$1")" || k=""
+  [[ "$k" =~ $RE_KEY ]] || refuse "The ${1} key for ${sha:0:8} could not be computed, so nothing ran."
+  printf '%s\n' "$k"
+}
+
+# found <tag> <key>: 0 and the id on stdout when <tag> is in the local Docker;
+# refuses when it is there under another key's label.
+found() {
+  local id
+  id="$(docker image inspect --format '{{.Id}}' "$1" 2> /dev/null)" || return 1
+  [[ "$id" =~ $RE_ID ]] || return 1
+  check_label "$1" "$2"
+  printf '%s\n' "$id"
+}
+
+check_label() {
+  local label
+  label="$(docker image inspect --format "{{with index .Config \"Labels\"}}{{index . \"${CIKIT_LABEL}\"}}{{end}}" "$1" 2> /dev/null)" || label=""
+  [ "$label" = "$2" ] || refuse "The image ${1} carries the image key label '${label}', so nothing ran."
+}
+
+# archive <dest> <path>...: the commit's copy of exactly those paths.
+archive() {
+  local dest="$1"
+  shift
+  git --literal-pathspecs archive --format=tar -o "$dest" "$sha" -- "$@" || refuse "The image's inputs could not be read from ${sha:0:8}, so nothing ran."
+}
+
+# gha_builder: the docker-container builder of the gha mode, made once. The
+# hosted runner's Docker has the classic image store, whose default driver
+# cannot export a gha cache.
+gha_builder() {
+  docker buildx inspect "$GHA_BUILDER" > /dev/null 2>&1 && return 0
+  docker buildx create --name "$GHA_BUILDER" --driver docker-container --driver-opt "image=${CI_BUILDKIT_IMAGE}" --bootstrap > /dev/null \
+    || refuse "The buildx builder ${GHA_BUILDER} could not be made, so nothing ran."
+}
+cache_flags() {
+  printf '%s\n' --cache-from "type=gha,scope=${GHA_SCOPE}$1" --cache-to "type=gha,mode=max,scope=${GHA_SCOPE}$1"
+}
+
+# base_build <context> <output flag>...: the base, from its own context.
+base_build() {
+  local context="$1" cache=() line
+  shift
+  if [ "${CIKIT_IMAGE_CACHE:-}" = gha ]; then
+    gha_builder
+    while IFS= read -r line; do cache+=("$line"); done <<< "$(cache_flags -base)"
+    set -- --builder "$GHA_BUILDER" --provenance=false --sbom=false "${cache[@]}" "$@"
+  fi
+  docker buildx build "$@" --build-arg "CIKIT_UID=${user}" --label "${CIKIT_LABEL}=${base_key}" \
+    -f ci/kit/image/base.Dockerfile - < "$context" >&2 \
+    || refuse "The kit's base image did not build for ${base_key:0:8}, so nothing ran."
+}
+
+# base_ready: base_key, base_tag and base_id, the base built when absent.
+base_ready() {
+  local context
+  base_key="$(key_of base)"
+  base_tag="${BASE_REPO}:${base_key}"
+  base_id="$(found "$base_tag" "$base_key")" && return 0
+  say "Building the kit's base image for ${base_key:0:8}. The first build takes several minutes; later runs reuse it."
+  temp_file
+  context="$made"
+  archive "$context" ci/kit/image
+  base_build "$context" --load -t "$base_tag"
+  base_id="$(docker image inspect --format '{{.Id}}' "$base_tag" 2> /dev/null)" || base_id=""
+  [[ "$base_id" =~ $RE_ID ]] || refuse "The base image ${base_tag} is not in the local Docker after its build, so nothing ran."
+  check_label "$base_tag" "$base_key"
+  built=true
+}
+
+# image_ready: image_key, image_tag and image_id, the job image built when
+# absent, FROM the base by CIKIT_BASE.
+image_ready() {
+  local context base_context layout index digest cache=() line from
+  image_key="$(key_of image)"
+  image_tag="${IMAGE_REPO}:${image_key}"
+  image_id="$(found "$image_tag" "$image_key")" && return 0
+  [ "${#image_paths[@]}" -gt 0 ] && [ -n "$image_file" ] || refuse "${sha:0:8} names no image inputs, so nothing ran."
+  temp_file
+  context="$made"
+  if [ "${CIKIT_IMAGE_CACHE:-}" = gha ]; then
+    # The base as an OCI layout pinned by its one manifest digest, handed to
+    # the job build by --build-context: a docker-container builder cannot see
+    # the local image store. Only the job image is loaded.
+    base_key="$(key_of base)"
+    say "Building the job image for ${image_key:0:8} with the Actions cache."
+    temp_file
+    base_context="$made"
+    archive "$base_context" ci/kit/image
+    temp_dir
+    layout="$made"
+    base_build "$base_context" --output "type=oci,dest=${layout},tar=false"
+    index="$(< "${layout}/index.json")" || index=""
+    [[ "$index" =~ $RE_LAYOUT_DIGEST ]] || refuse "The base's OCI layout names no manifest for ${base_key:0:8}, so nothing ran."
+    digest="${BASH_REMATCH[1]}"
+    index="${index#*"$digest"}"
+    if [[ "$index" =~ $RE_LAYOUT_DIGEST ]]; then
+      refuse "The base's OCI layout names more than one manifest for ${base_key:0:8}, so nothing ran."
+    fi
+    while IFS= read -r line; do cache+=("$line"); done <<< "$(cache_flags "")"
+    set -- --builder "$GHA_BUILDER" --provenance=false --sbom=false "${cache[@]}" \
+      --build-context "${BASE_CONTEXT}=oci-layout://${layout}@${digest}"
+    from="$BASE_CONTEXT"
+  else
+    base_ready
+    say "Building the job image for ${image_key:0:8}. The first build takes several minutes; later runs reuse it."
+    set --
+    from="$base_tag"
+  fi
+  archive "$context" "${image_paths[@]}"
+  docker buildx build "$@" --load --build-arg "CIKIT_BASE=${from}" --build-arg "CIKIT_INPUTS_HASH=${image_key}" \
+    --label "${CIKIT_LABEL}=${image_key}" -f "$image_file" -t "$image_tag" - < "$context" >&2 \
+    || refuse "The job image did not build for ${image_key:0:8}, so nothing ran."
+  image_id="$(docker image inspect --format '{{.Id}}' "$image_tag" 2> /dev/null)" || image_id=""
+  [[ "$image_id" =~ $RE_ID ]] || refuse "The job image ${image_tag} is not in the local Docker after its build, so nothing ran."
+  check_label "$image_tag" "$image_key"
+  built=true
+}
+
+# retain_images: after a build, removes this machine's older tags of the two
+# repositories beyond the CI_KEEP_IMAGES newest of each by creation time, the
+# images this run used counting as the newest. A tag is a candidate only as
+# <repository>:<64 hex> whose image-key label is that key (an image this
+# launcher built). Never removed: an image this run used, and an image any
+# container uses, running or stopped. `docker image rm` without -f untags and
+# frees only what nothing else holds. One line names what went. A failure
+# here never fails the run.
+retain_images() {
+  local repo line ref id created label key secs frac i j newer gone="" used=() refs=() ids=() times=()
+  while IFS= read -r line; do
+    [ -z "$line" ] || used+=("$line")
+  done <<< "$(docker ps -a -q --no-trunc 2> /dev/null || true)"
+  if [ "${#used[@]}" -gt 0 ]; then
+    line="$(docker container inspect --format '{{.Image}}' "${used[@]}" 2> /dev/null)" || line=""
+    used=()
+    while IFS= read -r id; do
+      [ -z "$id" ] || used+=("$id")
+    done <<< "$line"
+  fi
+  for repo in "$IMAGE_REPO" "$BASE_REPO"; do
+    refs=() ids=() times=()
+    while IFS= read -r ref; do
+      [[ "$ref" =~ ^${repo}:([0-9a-f]{64})$ ]] || continue
+      key="${BASH_REMATCH[1]}"
+      line="$(docker image inspect --format "{{.Created}}|{{.Id}}|{{with index .Config \"Labels\"}}{{index . \"${CIKIT_LABEL}\"}}{{end}}" "$ref" 2> /dev/null)" || continue
+      created="${line%%|*}"
+      line="${line#*|}"
+      id="${line%%|*}"
+      label="${line#*|}"
+      [[ "$id" =~ $RE_ID ]] || continue
+      [[ "$created" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.([0-9]+))?Z$ ]] || continue
+      secs="${BASH_REMATCH[1]}"
+      frac="${BASH_REMATCH[3]}000000000"
+      [ "$label" = "$key" ] || continue
+      # What this run used counts as the newest whatever its date: a base
+      # rebuilt from the cache keeps the date of the first build.
+      if [ "$ref" = "$image_tag" ] || [ "$ref" = "$base_tag" ]; then secs=9999-12-31T23:59:59 frac=9; fi
+      refs+=("$ref")
+      ids+=("$id")
+      times+=("${secs}.${frac:0:9}")
+    done <<< "$(docker image ls --no-trunc --format '{{.Repository}}:{{.Tag}}' "$repo" 2> /dev/null || true)"
+    i=0
+    while [ "$i" -lt "${#refs[@]}" ]; do
+      newer=0
+      j=0
+      while [ "$j" -lt "${#refs[@]}" ]; do
+        if [[ "${times[$j]}" > "${times[$i]}" ]] || { [ "${times[$j]}" = "${times[$i]}" ] && [[ "${refs[$j]}" > "${refs[$i]}" ]]; }; then
+          newer=$((newer + 1))
+        fi
+        j=$((j + 1))
+      done
+      ref="${refs[$i]}"
+      id="${ids[$i]}"
+      i=$((i + 1))
+      [ "$newer" -ge "$CI_KEEP_IMAGES" ] || continue
+      [ "$ref" != "$image_tag" ] && [ "$ref" != "$base_tag" ] || continue
+      case " ${used[*]-} " in *" ${id} "*) continue ;; esac
+      if docker image rm "$ref" > /dev/null 2>&1; then gone="${gone}, ${ref}"; fi
+    done
+  done
+  if [ -n "$gone" ]; then
+    say "Removed the older job images ${gone#, }; the ${CI_KEEP_IMAGES} newest of each are kept."
+  fi
+  return 0
+}
+
+# ready_for <job>: run_tag and run_image for the image <job> runs in: the
+# base for the kit job (kit/README.md §5.6, §3.2), the job image for every other.
+run_tag="" run_image=""
+ready_for() {
+  if [ "$1" = "$kit_job" ]; then
+    base_ready
+    run_tag="$base_tag" run_image="$base_id"
+  else
+    image_ready
+    run_tag="$image_tag" run_image="$image_id"
+  fi
+  if [ "$built" = true ]; then retain_images; built=false; fi
+}
+
+cmd_image() {
+  ready_for "${jobs[0]:-}"
+  printf '%s %s\n' "$run_tag" "$run_image"
+}
+
+# --- versions -----------------------------------------------------------------------------
+
+# THE READER. Its arguments: the awk program, an optional --tree (the archive
+# of the probes' directories on stdin), then per tool
+# `<tool> <kind> <word> <dir> <n> <argv of n words>`. Each argv runs as an
+# argument vector with stdout alone kept; its output goes through the one
+# awk program with the kind and word in the environment. It prints
+# `<tool> <answer>` per tool, the answer empty when none was found.
+# shellcheck disable=SC2016
+readonly CIKIT_READER='
+set -u
+prog="$1"; shift
+root=/
+if [ "${1:-}" = --tree ]; then shift; root="$(mktemp -d)"; tar -x -f - -C "$root" 2> /dev/null || true; fi
+probe() { ( if [ -n "$dir" ]; then cd "$root/$dir" 2> /dev/null || exit 127; fi; "$@" 2> /dev/null < /dev/null ); }
+while [ "$#" -ge 5 ]; do
+  tool="$1" kind="$2" word="$3" dir="$4" n="$5"; shift 5
+  argv=("${@:1:$n}"); shift "$n"
+  out=""
+  case "$kind" in
+    version-flag) out="$(probe "${argv[@]}" --version)" || out="$(probe "${argv[@]}" version)" || out="" ;;
+    python-minor) out="$(probe "${argv[@]}" -c "import sys; print(\"%d.%d\" % sys.version_info[:2])")" || out="" ;;
+    first-line | after-word) out="$(probe "${argv[@]}")" || true ;;
+  esac
+  printf "%s %s\n" "$tool" "$(printf "%s\n" "$out" | K="$kind" W="$word" awk "$prog")"
+done
+'
+# The one awk program: the four kinds of kit/README.md §3.4. A token is stripped of the
+# surrounding characters ] [ ( ) , ; before it is tested, compared with an
+# after-word WORD, or printed (so `after-word core` reads `[core 2.21.4]`).
+# shellcheck disable=SC2016
+readonly CIKIT_READER_AWK='
+function strip(t) { gsub(/^[][(),;]+/, "", t); gsub(/[][(),;]+$/, "", t); return t }
+ENVIRON["K"] == "first-line" || ENVIRON["K"] == "python-minor" { s = $0; gsub(/^[ \t]+|[ \t]+$/, "", s); print s; exit }
+ENVIRON["K"] == "version-flag" { for (i = 1; i <= NF; i++) { t = strip($i); if (t ~ /^v?[0-9]+\.[0-9]+(\.[0-9]+)?/) { print t; exit } } }
+ENVIRON["K"] == "after-word" { for (i = 1; i <= NF; i++) if (strip($i) == ENVIRON["W"]) { if (i < NF) print strip($(i + 1)); exit } }
+'
+
+# probe_args <tool>: appends the tool's reader arguments to probe_list and
+# its directory, if any, to probe_dirs, from its `probe` line or the default.
+probe_list=() probe_dirs=()
+probe_args() {
+  local i w=() kind=version-flag word="" dir="" n argv=()
+  for i in "${!m_dir[@]}"; do
+    [ "${m_dir[$i]}" = probe ] || continue
+    case "${m_arg[$i]}" in "$1$tab"*) ;; *) continue ;; esac
+    IFS="$tab" read -r -a w <<< "${m_arg[$i]}"
+    kind="${w[1]}"
+    n=2
+    if [ "$kind" = after-word ]; then word="${w[2]}"; n=3; fi
+    if [ "${w[$n]:-}" = in ]; then dir="${w[$((n + 1))]}"; n=$((n + 2)); fi
+    while [ "$n" -lt "${#w[@]}" ]; do argv+=("${w[$n]}"); n=$((n + 1)); done
+    break
+  done
+  if [ "${#argv[@]}" -eq 0 ]; then
+    if [ "$kind" = python-minor ]; then argv=(python3); else argv=("$1"); fi
+  fi
+  case "$kind" in version-flag | first-line | after-word | python-minor) ;; *) refuse "The probe kind ${kind} of ${1} is not one this kit knows, so nothing ran." ;; esac
+  probe_list+=("$1" "$kind" "$word" "$dir" "${#argv[@]}" "${argv[@]}")
+  if [ -n "$dir" ]; then probe_dirs+=("$dir"); fi
+}
+
+cmd_versions() {
+  local job tool tools=() input=/dev/null tree=()
+  for job in "${jobs[@]}"; do
+    for tool in $(m_job pin "$job"); do
+      case " ${tools[*]-} " in *" ${tool} "*) ;; *) tools+=("$tool") ;; esac
+    done
+  done
+  [ "${#tools[@]}" -gt 0 ] || return 0
+  image_ready
+  if [ "$built" = true ]; then retain_images; built=false; fi
+  for tool in "${tools[@]}"; do probe_args "$tool"; done
+  if [ "${#probe_dirs[@]}" -gt 0 ]; then
+    temp_file
+    input="$made"
+    git --literal-pathspecs archive --format=tar -o "$input" "$sha" -- "${probe_dirs[@]}" || refuse "The probes' directories could not be read from ${sha:0:8}, so nothing ran."
+    tree=(--tree)
+  fi
+  docker run --rm -i --network none "${HARDEN[@]}" --user "${user}:${user}" "$image_tag" bash -c "$CIKIT_READER" _ "$CIKIT_READER_AWK" ${tree[@]+"${tree[@]}"} "${probe_list[@]}" < "$input"
+}
+
+# --- run ---------------------------------------------------------------------------------
+
+cmd_run() {
+  local job="${jobs[0]}" tree input shallow gid i kind vol target var url rc
+  local flags=() envs=() caches=() svc=() history=false socket=false install
+  if [ -z "$run_id" ]; then
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_JOB:-}" ]; then
+      run_id="${GITHUB_RUN_ID}-${GITHUB_JOB}"
+    else
+      run_id="$$"
+    fi
+  fi
+  [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || refuse "The run id ${run_id} is not a name Docker accepts, so ${job} did not run."
+  if m_lists history "$job"; then history=true; fi
+  if m_lists socket "$job"; then socket=true; fi
+  read -r -a svc <<< "$(m_job service "$job")"
+  if [ "${#svc[@]}" -gt 0 ] && [ "$socket" = true ]; then
+    refuse "${job} names both a service and the socket, which take different networks, so ${job} did not run."
+  fi
+  if [ "$history" = true ]; then
+    # The whole history or nothing, decided before any container starts.
+    shallow="$(git rev-parse --is-shallow-repository)" || refuse "Whether this clone is shallow could not be read, so ${job} did not run."
+    [ "$shallow" = false ] || refuse "${job} needs the commit's whole history and this clone is shallow, so ${job} did not run."
+  fi
+  ready_for "$job"
+  tree="$(git rev-parse --verify -q "${sha}^{tree}")" || refuse "${sha:0:8} has no tree, so ${job} did not run."
+  temp_file
+  input="$made"
+  if [ "$history" = true ]; then
+    # THE COMMIT ITSELF: a pack of the commit and every object it reaches,
+    # made from its id alone, so no ref is written here and no other ref,
+    # record or stash goes in. Replace objects are ignored.
+    git --no-replace-objects pack-objects --revs --stdout -q <<< "$sha" > "$input" \
+      || refuse "The pack of ${sha:0:8} and its history could not be made, so ${job} did not run."
+  else
+    # THE TREE GOES IN BY COPY: the commit's archive, never the working copy.
+    git --literal-pathspecs archive --format=tar -o "$input" "$sha" || refuse "The archive of ${sha:0:8} could not be made, so ${job} did not run."
+  fi
+
+  # The caches: named volumes on the workstation; in CI, directories under
+  # $RUNNER_TEMP that actions/cache restores and saves.
+  for vol in $(m_job cache "$job"); do
+    case "$vol" in
+      gomod) target="${CI_HOME}/go/pkg/mod" ;;
+      gobuild) target="${CI_HOME}/.cache/go-build" ;;
+      npm) target="${CI_HOME}/.npm" ;;
+      *) refuse "The cache kind ${vol} is not one this kit knows, so ${job} did not run." ;;
+    esac
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+      [ -n "${RUNNER_TEMP:-}" ] || refuse "RUNNER_TEMP is unset in CI, so ${job} did not run."
+      mkdir -p "${RUNNER_TEMP}/${project}-ci-${vol}"
+      caches+=(--mount "type=bind,source=${RUNNER_TEMP}/${project}-ci-${vol},target=${target}")
+    else
+      caches+=(--mount "type=volume,source=${project}-ci-${vol},target=${target}")
+    fi
+  done
+
+  # The environment, by an allow-list of names.
+  envs=(-e "CIKIT_TREE=${tree}" -e "CIKIT_JOB=${job}" -e "CIKIT_PROJECT=${project}")
+  if [ "$job" = "$kit_job" ]; then envs+=(-e "CIKIT_ADAPTER=${CIKIT_KIT_VERDICT}"); else envs+=(-e "CIKIT_ADAPTER=${adapter}"); fi
+  install="$(m_job install "$job")"
+  if [ -n "$install" ]; then envs+=(-e "CIKIT_INSTALL=${install}"); fi
+  if [ "$history" = true ]; then envs+=(-e "CIKIT_COMMIT=${sha}"); fi
+  url=""
+  if [ "${#svc[@]}" -gt 0 ]; then
+    i=1
+    while [ "$i" -lt "${#svc[@]}" ]; do
+      if [ "${svc[$i]}" = url-env ]; then url="${svc[$((i + 1))]}"; fi
+      i=$((i + 2))
+    done
+  fi
+  for var in $(m_job env "$job"); do
+    # The reserved names are the commit's library's one list (KIT_RESERVED_ENV).
+    rc=0
+    keys_call kit_env_reserved "$var" || rc=$?
+    case "$rc" in
+      0) refuse "The variable ${var} is the kit's to set, so ${job} did not run." ;;
+      1) ;;
+      *) refuse "Whether the variable ${var} is reserved could not be read from ${sha:0:8}'s library, so ${job} did not run." ;;
+    esac
+    [ "$var" != "$url" ] || refuse "The variable ${var} is the kit's to set, so ${job} did not run."
+    # The manifest's parser holds var to ^[A-Z][A-Z0-9_]*$; bash's own
+    # indirect expansion reads it, set and empty included.
+    if [ -n "${!var+set}" ]; then envs+=(-e "${var}=${!var}"); fi
+  done
+  # CI=true is a constant under GITHUB_ACTIONS alone (DESIGN.md §6.2,
+  # kit/README.md §2.2): a runner's allowances read CI, and a workstation run
+  # keeps its stricter bounds.
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then envs+=(-e "GITHUB_ACTIONS=true" -e "CI=true"); fi
+
+  if [ "${#svc[@]}" -gt 0 ]; then
+    service_start "$job"
+    flags=(--network "$network")
+    envs+=(-e "${url}=postgres://${project}:${project}-test-password@${svc_container}:5432/postgres?sslmode=disable")
+  elif [ "$socket" = true ]; then
+    # The socket's group id, read inside a throwaway container of the image,
+    # so no host stat (whose flags differ between BSD and GNU) is called.
+    # shellcheck disable=SC2016
+    gid="$(docker run --rm --network none "${HARDEN[@]}" --user "${user}:${user}" -v "${CI_SOCKET}:${CI_SOCKET}" "$run_tag" bash -c 'stat -c %g "$1"' _ "$CI_SOCKET")" || gid=""
+    [[ "$gid" =~ ^[0-9]+$ ]] || refuse "The Docker socket's group could not be read, so ${job} did not run."
+    flags=(-v "${CI_SOCKET}:${CI_SOCKET}" --group-add "$gid" --network host)
+  else
+    flags=(--network bridge)
+  fi
+
+  job_container="${project}-ci-${job}-${run_id}"
+  say "==> ${job} in ${run_tag:0:${#project}+20} as ${job_container}, the tree ${tree:0:12} of ${sha:0:8}"
+  i=0
+  docker run --rm -i --name "$job_container" --user "${user}:${user}" "${HARDEN[@]}" \
+    "${flags[@]}" ${caches[@]+"${caches[@]}"} "${envs[@]}" \
+    "$run_tag" "$CIKIT_ENTRY" "$job" < "$input" || i=$?
+  if [ "$i" -ne 0 ] && [ -n "$svc_container" ]; then
+    say "${job} failed (exit ${i}). The last ${CI_SERVICE_LOG_LINES} lines of ${svc_container}'s log follow."
+    docker logs --tail "$CI_SERVICE_LOG_LINES" "$svc_container" >&2 || true
+  fi
+  return "$i"
+}
+
+# service_start <job>: the job's sidecar on a network of its own, published
+# nowhere, from svc (the words of its `service` line); sets network and
+# svc_container. One kind in manifest v1: postgres.
+service_start() {
+  local job="$1" kind="${svc[0]}" img="" i flagv=()
+  i=1
+  while [ "$i" -lt "${#svc[@]}" ]; do
+    case "${svc[$i]}" in
+      image) img="${svc[$((i + 1))]}" ;;
+      flag) flagv+=(-c "${svc[$((i + 1))]}") ;;
+    esac
+    i=$((i + 2))
+  done
+  [ "$kind" = postgres ] || refuse "The service kind ${kind} is not one this kit knows, so ${job} did not run."
+  [[ "$img" =~ @sha256:[0-9a-f]{64}$ ]] || refuse "The ${kind} service of ${job} names no image by digest, so ${job} did not run."
+  network="${project}-ci-${run_id}"
+  docker network create "$network" > /dev/null || { network=""; refuse "The network ${project}-ci-${run_id} could not be made, so ${job} did not run."; }
+  svc_container="${project}-check-${kind}-${run_id}"
+  docker run -d --name "$svc_container" --network "$network" \
+    -e "POSTGRES_USER=${project}" -e "POSTGRES_PASSWORD=${project}-test-password" \
+    "$img" ${flagv[@]+"${flagv[@]}"} > /dev/null || refuse "The check's own ${kind} could not start, so ${job} did not run."
+  i=0
+  until docker exec "$svc_container" pg_isready -U "$project" -d postgres -q > /dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -ge 60 ]; then
+      docker logs "$svc_container" >&2 || true
+      refuse "The check's own ${kind} did not become ready within 60 seconds, so ${job} did not run."
+    fi
+    sleep 1
+  done
+  say "The check's own ${kind} ${svc_container} is ready on ${network} (after ${i}s)."
+}
+
+case "$cmd" in
+  image) cmd_image ;;
+  versions) cmd_versions ;;
+  run)
+    rc=0
+    cmd_run || rc=$?
+    exit "$rc"
+    ;;
+esac

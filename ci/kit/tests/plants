@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""THE PLANTED DEFECTS (kit/README.md §6.2, §6.1).
+
+For each plant: copy the kit tree under test to a scratch directory, make ONE
+edit to ONE file of the copy, run the plant's family against that copy
+(KITT_KIT=<copy>) and require it to fail, printing the first failing line and
+how many cases failed. The kit tree itself is never touched. Each edit's old
+text must occur exactly once (or, for the by-rule edits, in the named block),
+so a kit that has moved since this table was written fails here, loudly, not
+by silently planting nothing.
+
+  python3 kit/tests/plants [--only <id>]... [--bash <bash>] [--list]
+
+Exit 0 when every plant turned its family red; 1 otherwise. KITT_KIT, if set,
+is the tree planted from. Needs python3 and the host's bash 3.2 or later.
+"""
+import os, re, shutil, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+KIT = os.environ.get("KITT_KIT") or os.path.dirname(HERE)
+
+
+def once(old, new):
+    def f(s):
+        if s.count(old) != 1:
+            raise SystemExit("plant text occurs %d times, not once: %r" % (s.count(old), old[:80]))
+        return s.replace(old, new)
+    return f
+
+
+def append(text):
+    return lambda s: s + text
+
+
+def label(n):
+    def f(s):
+        if '"W-%d"' % n not in s:
+            raise SystemExit("no label W-%d" % n)
+        return s.replace('"W-%d"' % n, '"W-0"')
+    return f
+
+
+def chain(*edits):
+    def f(s):
+        for e in edits:
+            s = e(s)
+        return s
+    return f
+
+
+def lint_rule(n):
+    def f(s):
+        m = re.search(r"^# --- Rule %d\b.*$" % n, s, re.M)
+        if not m:
+            raise SystemExit("no Rule %d block" % n)
+        nxt = re.search(r"^# --- Rule \d+", s[m.end():], re.M)
+        end = m.end() + (nxt.start() if nxt else len(s) - m.end())
+        block = s[m.end():end]
+        new, k = re.subn(r"\bfinding0?\b(?= )", ":", block)
+        if not k:
+            raise SystemExit("Rule %d has no finding to remove" % n)
+        return s[:m.end()] + new + s[end:]
+    return f
+
+
+P = []  # (id, family, file, edit, what it removes or plants)
+def plant(i, fam, file, edit, what): P.append((i, fam, file, edit, what))
+
+plant("keys-newline", "keys", "lib/keys.sh", once('''  payload="${KIT_PROJECT}-ci-keys v${KIT_KEY_EPOCH}"$'\\n\'''', '''  payload="${KIT_PROJECT}-ci-keys v${KIT_KEY_EPOCH}"'''), "the key header's newline dropped")
+plant("keys-worktree", "keys", "lib/keys.sh", once('text="$(git -C "$repo" show "${resolved}:ci/manifest" 2>/dev/null)"', 'text="$(cat "$repo/ci/manifest" 2>/dev/null)"'), "the manifest read from the working tree")
+plant("dump-shape", "dump", "lib/keys.sh", once('if (d == "refuse-drafts") return NF == 2 && ($2 == "yes" || $2 == "no")', 'if (d == "refuse-drafts") return NF == 2'), "a shape rule moved out of the awk program")
+for n in range(2, 13):
+    if n in (11,) or True:
+        plant("manifest-rule-%d" % n, "manifest", "bin/check-manifest", lint_rule(n), "lint rule %d removed" % n)
+plant("green-slug", "green", "lib/keys.sh", once('select(.conclusion == "success" and .app.slug == "github-actions")', 'select(.conclusion == "success")'), "the app-slug filter removed")
+plant("local-verify", "local", "lib/keys.sh", once('if ! ssh-keygen -Y verify -f "$dir/signers" -I "$principal" -n git -s "$dir/sig" < "$dir/payload" > /dev/null 2>&1; then', 'if false; then'), "the -Y verify call removed")
+plant("local-signers", "local", "lib/keys.sh", once('git -C "$repo" show "${main}:${signers}"', 'git -C "$repo" show "${obj}^{commit}:${signers}"'), "main's signers replaced by the checkout's")
+plant("plan-schedule", "plan", "bin/plan", once('if [ "$CI_PLAN_EVENT" = schedule ]; then\n  CI_PLAN_TASK=weekly\nfi', ':'), "the schedule arm removed")
+plant("plan-prefix", "plan", "bin/plan", once('ref_group="weekly-${ref_group}"', 'ref_group="${ref_group}"'), "the weekly- prefix removed")
+plant("extension-snapshot", "extension", "bin/plan", once('[ "${KIT_DECISION[$job]-}" = "${kit_snap_decision[$job]}" ] || kit__ext_refuse "$job"', ':'), "the snapshot comparison removed")
+plant("record-422", "record", "bin/record", once("if grep -q 'Reference already exists' \"$body\"; then", "if true; then"), "the 422 text check removed")
+plant("prune-tip", "prune", "bin/prune", once('for k in ${keep[@]+"${keep[@]}"}; do [ "$k" != "$ref" ] || continue 2; done', ':'), "the tip exception removed")
+plant("driver-trap", "driver", "bin/container", once('trap cleanup EXIT', ':'), "the cleanup trap removed")
+plant("driver-rename", "driver", "bin/local-ci", once('if mv "$lock" "$aside" 2> /dev/null; then', 'if printf \'%s\\n\' "$$" > "${lock}/pid"; then'), "the stale-lock rename replaced by a pid write")
+plant("driver-isolation", "driver", "bin/container", once('docker run --rm -i --name "$job_container"', 'docker run --rm -i --privileged --name "$job_container"'), "the job container made privileged (the isolation lost)")
+plant("driver-pipe", "driver", "bin/local-ci", once('"$BASH" "$launcher" run --run-id "$$" --commit "$sha" "$job" > "$log" 2>&1 < /dev/null || rc=$?', '"$BASH" "$launcher" run --run-id "$$" --commit "$sha" "$job" 2>&1 < /dev/null | cat > "$log" || true'), "the job's status read through a pipe")
+plant("shape-source", "shape", "bin/local-ci", once('"$BASH" -c \'. "$1"; shift; "$@"\' _ "$file" "$@" || rc=$?', '. "$file"; "$@" || rc=$?'), "the commit's library sourced into the driver")
+plant("signpush-entry", "signpush", "bin/local-ci", once('[ -f "$entry" ] || refuse "There is no passing run of ${job} for ${sha:0:8}, so nothing was signed. Run ${check_command} first."', ':'), "sign without the passing-entry check")
+plant("hook-status", "hook", "bin/pre-push", once('"$BASH" "$local_ci" run --commit "$sha" "${jobs[@]}" < /dev/null || rc=$?', '"$BASH" "$local_ci" run --commit "$sha" "${jobs[@]}" < /dev/null || true'), "sign called without the run's status read")
+for n in range(1, 13):
+    plant("workflow-w%d" % n, "workflow", "bin/check-workflow", label(n), "rule W-%d removed" % n)
+plant("escaping-comments", "escaping", "bin/check-escaping-reads", once("    def blank(a, b):\n        for k in range(a, b):", "    def blank(a, b):\n        return\n        for k in range(a, b):"), "the comment stripper bypassed")
+plant("prereq-git", "prereq", "bin/check-prereqs", once('[ "$minor" -lt 34 ]', '[ "$minor" -lt 0 ]'), "the git version check removed")
+plant("launcher-socket", "launcher", "bin/container", once('if m_lists socket "$job"; then socket=true; fi', 'if m_lists socket "$job" || [ "$job" = alpha ]; then socket=true; fi'), "a socket granted to alpha")
+plant("reader-bracket", "reader", "bin/container", once('gsub(/[][(),;]+$/, "", t); ', ''), "the stripping of ] removed")
+plant("twokeys-base", "twokeys", "lib/keys.sh", once("base) printf '%s\\n' ci/kit/image ;;", "base) printf '%s\\n' ci/kit/image; kit__words \"$KIT_IMAGE_PATH\" ;;"), "the base's key widened to image-path")
+plant("update-verify", "update", "bin/kit-update", once('err="$(g -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" tag -v "$tag" 2>&1 > /dev/null)" || rc=$?', 'err=\'Good "git" signature for planted with ED25519 key SHA256:x\''), "the tag -v call removed")
+plant("host-sed", "host", "bin/pre-push", append("sed s/a/b/ /dev/null\n"), "a sed planted in pre-push")
+plant("image-user", "IMAGE:image", "image/base.Dockerfile", once("USER ci\n", ""), "USER removed from the base")
+plant("enter-tree", "IMAGE:enter", "image/enter.sh", once('[ "$tree" = "$CIKIT_TREE" ] || not_the_tree', ':'), "the tree comparison removed from enter.sh")
+
+
+# --- the security review's fixes (SECURITY.md), one plant per clause ----------------
+plant("update-tag-header", "update", "bin/kit-update", once('[ "$type" = commit ] && [ "$name" = "$tag" ] \\', '[ "$type" = commit ] \\'), "release check (a): the tag-header check removed")
+plant("update-ancestry", "update", "bin/kit-update", once('g merge-base --is-ancestor "$commit" "refs/remotes/origin/${KIT_MAIN}" \\', 'true \\'), "release check (b): the ancestry check removed")
+plant("update-merged-capture", "update", "bin/kit-update", once('tag -v "$tag" 2>&1 > /dev/null)"', 'tag -v "$tag" 2>&1)"'), "release check (c): the merged 2>&1 capture restored")
+plant("update-working-signers", "update", "bin/kit-update", chain(
+    once('[ "$(git -C "$top" hash-object --no-filters -- "${top}/ci/KIT-SIGNERS")" = "$main_blob" ] \\', 'true \\'),
+    once('git -C "$top" cat-file blob "$main_blob" > "$signers"', 'cat "${top}/ci/KIT-SIGNERS" > "$signers"')), "release check (d): the working copy's ci/KIT-SIGNERS read, and not compared with main's")
+plant("keys-path-shape", "manifest", "lib/keys.sh", chain(
+    once('index(s, "*") || index(s, "?") || index(s, "[") || index(s, "]") || index(s, "\\\\") || index(s, ":")', '0'),
+    once('return s != "" && s !~ /^-/ && s !~ /[ \\t]/', 'return s != "" && s !~ /[ \\t]/'),
+    once('name !~ /^-/ &&\n', '')), "the older PATH shape and digested name restored")
+plant("launcher-literal", "launcher", "bin/container", once('git --literal-pathspecs archive --format=tar -o "$dest"', 'git archive --format=tar -o "$dest"'), "--literal-pathspecs removed from one git archive")
+plant("keys-job-reserved", "manifest", "lib/keys.sh", once('if (d == "job" && ($2 == "image" || $2 == "base")) refuse(', 'if (0) refuse('), "the job-name reservation removed")
+plant("keys-reserved-env", "manifest", "lib/keys.sh", once("ACTIONS_* RUNNER_* GH_* GIT_* SSH_* DOCKER_* PATH", "ACTIONS_* RUNNER_* GH_* GIT_* SSH_* PATH"), "DOCKER_* dropped from the reserved constant")
+plant("keys-reserved-env-launcher", "launcher", "lib/keys.sh", once("ACTIONS_* RUNNER_* GH_* GIT_* SSH_* DOCKER_* PATH", "ACTIONS_* RUNNER_* GH_* GIT_* SSH_* PATH"), "DOCKER_* dropped from the constant the launcher reads")
+plant("manifest-socket-install", "manifest", "bin/check-manifest", once('has_word "${W[1]}" "$socketed" && finding "$LINE" "install names', 'false && finding "$LINE" "install names'), "the install-on-a-socket-job clause removed")
+plant("manifest-socket-service", "manifest", "bin/check-manifest", once('has_word "${W[1]}" "$socketed" && finding "$LINE" "service names', 'false && finding "$LINE" "service names'), "the service-on-a-socket-job clause removed")
+plant("keys-facts-names", "manifest", "lib/keys.sh", once('split("job key commit started duration_s platform host docker image not_run log_sha256", a, " ")', 'split("", a, " ")'), "the facts-name list emptied")
+plant("plan-outputs-live", "extension", "bin/plan", once("printf '%s=%s\\n' \"$job\" \"${kit_snap_decision[$job]}\"", "printf '%s=%s\\n' \"$job\" \"${decision[$job]}\""), "the kit jobs' outputs written from the live arrays")
+plant("plan-key-check", "extension", "bin/plan", once('      || kit__ext_refuse_key "$job"', '      || :'), "the key comparison removed")
+plant("manifest-always-on", "manifest", "bin/check-manifest", once('    || finding "$(line_of paths "$KIT_ALWAYS_ON")" "the key of the always-on job', '    || : "$(line_of paths "$KIT_ALWAYS_ON")" "the key of the always-on job'), "rule 3's always-on clause removed")
+plant("manifest-copy-from", "manifest", "bin/check-manifest", once('finding0 "${KIT_IMAGE} line ${at}: COPY --from=', ': "${KIT_IMAGE} line ${at}: COPY --from='), "the COPY --from= clause removed")
+plant("manifest-run-mount", "manifest", "bin/check-manifest", once('finding0 "${KIT_IMAGE} line ${at}: RUN --mount=', ': "${KIT_IMAGE} line ${at}: RUN --mount='), "the RUN --mount from= clause removed")
+plant("manifest-syntax", "manifest", "bin/check-manifest", once('finding0 "${KIT_IMAGE} line ${fl}: # syntax=', ': "${KIT_IMAGE} line ${fl}: # syntax='), "the # syntax= clause removed")
+USERLINE = "case \"${2:-}\" in image | base) payload+=\"user ${KIT_USER}\"$'\\n' ;; esac"
+plant("keys-user-line", "keys", "lib/keys.sh", once(USERLINE, ':'), "the user value line dropped from the base and image keys")
+plant("keys-user-line-images", "twokeys", "lib/keys.sh", once(USERLINE, ':'), "the same, seen by the images built")
+plant("workflow-w1-run", "workflow", "bin/check-workflow", once('if "workflow_run" in triggers(d):', 'if False:'), "W-1's workflow_run clause removed")
+plant("workflow-w7-word", "workflow", "bin/check-workflow", once('elif not u and code in image_steps:', 'elif not u and code.startswith(image_steps[0]):'), "W-7 accepts any job word on the image step")
+plant("workflow-w8-spellings", "workflow", "bin/check-workflow", once('TOKEN_EXPR = re.compile(\n', 'TOKEN_EXPR = re.compile(r"(?!)")\n_UNUSED = re.compile(\n'), "W-8's token expressions no longer matched")
+plant("launcher-reader-hardening", "launcher", "bin/container", once('docker run --rm -i --network none "${HARDEN[@]}" --user "${user}:${user}" "$image_tag" bash -c "$CIKIT_READER"', 'docker run --rm -i --network none "$image_tag" bash -c "$CIKIT_READER"'), "the hardening removed from the reader")
+plant("launcher-job-hardening", "IMAGE:harden", "bin/container", once('--user "${user}:${user}" "${HARDEN[@]}" \\\n', '--user "${user}:${user}" \\\n'), "the hardening removed from the job run (seen by docker inspect)")
+plant("manifest-unsourced-pin", "manifest", "bin/check-manifest", once('      finding "$LINE" "pin names ${tool} for ${job}, which no pin-source', '      : "$LINE" "pin names ${tool} for ${job}, which no pin-source'), "rule 4's unsourced-pin clause removed")
+
+# CI=true under GITHUB_ACTIONS only, and CI reserved from env (DESIGN.md §6.2, kit/README.md §2.2)
+plant("launcher-ci-condition", "launcher", "bin/container", once('then envs+=(-e "GITHUB_ACTIONS=true" -e "CI=true"); fi', 'then envs+=(-e "GITHUB_ACTIONS=true"); fi; envs+=(-e "CI=true")'), "CI=true (b): the GITHUB_ACTIONS condition dropped from CI=true")
+plant("local-ci-unset-actions", "launcher", "bin/local-ci", once('GIT_OBJECT_DIRECTORY GITHUB_ACTIONS\n', 'GIT_OBJECT_DIRECTORY\n'), "CI=true (c): GITHUB_ACTIONS removed from local-ci's unset")
+plant("keys-reserved-ci", "manifest", "lib/keys.sh", once("PATH HOME CI *_TOKEN", "PATH HOME *_TOKEN"), "CI=true (d): CI removed from the reserved constant")
+plant("keys-reserved-ci-launcher", "launcher", "lib/keys.sh", once("PATH HOME CI *_TOKEN", "PATH HOME *_TOKEN"), "CI=true (d): CI removed from the constant the launcher reads")
+
+def main(argv):
+    only, bash, listing = [], os.environ.get("BASH") or "/bin/bash", False
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--only": only.append(argv[i + 1]); i += 2
+        elif argv[i] == "--bash": bash = argv[i + 1]; i += 2
+        elif argv[i] == "--list": listing = True; i += 1
+        else: raise SystemExit("usage: plants [--only id]... [--bash bash] [--list]")
+    if listing:
+        for pid, fam, file, _e, what in P: print(pid, fam, file, what)
+        return 0
+    bad = 0
+    for pid, fam, file, edit, what in P:
+        if only and pid not in only: continue
+        scratch = tempfile.mkdtemp(prefix="cikit-lct-plant-")
+        try:
+            copy = os.path.join(scratch, "kit")
+            shutil.copytree(KIT, copy, symlinks=True)
+            path = os.path.join(copy, file)
+            with open(path, encoding="utf-8") as fh: text = fh.read()
+            new = edit(text)
+            if new == text: raise SystemExit("plant %s changed nothing" % pid)
+            with open(path, "w", encoding="utf-8") as fh: fh.write(new)
+            if fam.startswith("IMAGE:"):
+                cmd = [bash, os.path.join(copy, "tests", "image"), "--family", fam[6:]]
+            else:
+                cmd = [bash, os.path.join(copy, "tests", "run"), "--family", fam]
+            env = dict(os.environ, KITT_KIT=copy, KITT_QUIET="1")
+            try:
+                r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+                fails = [l for l in r.stdout.splitlines() if l.startswith("FAIL:")]
+                verdict = "RED" if r.returncode != 0 and fails else "NOT RED"
+            except subprocess.TimeoutExpired:
+                fails, verdict = ["FAIL: (the family did not finish in 600 s: a hang is not a pass)"], "RED"
+            if verdict != "RED": bad += 1
+            print("%-22s %-9s %-8s fails=%-3d | %s | %s" % (pid, fam, verdict, len(fails), what, (fails[0][:150] if fails else "(none)")), flush=True)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+    print("plants: %s" % ("all red" if not bad else "%d NOT RED" % bad))
+    return 1 if bad else 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

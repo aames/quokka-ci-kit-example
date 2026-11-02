@@ -1,0 +1,3 @@
+#!/bin/sh
+# The kit's hook (ci/kit/bin/pre-push) runs; this file is held byte-equal to ci/kit/hooks/pre-push.shim.
+exec bash "$(git rev-parse --show-toplevel)/ci/kit/bin/pre-push" "$@"

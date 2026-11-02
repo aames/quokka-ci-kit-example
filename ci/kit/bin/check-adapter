@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+#
+# THE CONTRACT CHECK FOR A REAL ADAPTER (kit/README.md §4.1, §4.5; §7
+# step 6), run by the adopter on a workstation at HEAD:
+#
+#   ci/kit/bin/check-adapter <job>
+#
+#   (a) `<adapter> no-such-job` exits 2 and prints no counts line. It runs
+#       where the adapter runs, in the job image through cikit-enter, with
+#       HEAD's archive on stdin, no network and the manifest's user.
+#   (b) On the log of one real passing run of <job> at HEAD through the
+#       driver (ci/kit/bin/local-ci run), exactly one counts line names the
+#       job's `count` FIELDs in order, each value one to nine digits and
+#       above zero, and every line starting `NOT RUN ` is in the one shape
+#       `NOT RUN <leg>: <reason>` with its leg a `not-run-allowed` LEG of the
+#       working copy's ci/manifest.
+# What no generic check can do stays the adopter's: one planted failing step
+# per arm that turns the arm red and removes the counts line (kit/README.md §6.3).
+#
+# <job> is a `local` job of HEAD's ci/manifest other than the kit job, whose
+# verdict is the kit's own proofs, not the adapter.
+#
+# BASH 3.2: this runs under the macOS /bin/bash. HEAD's ci/kit/lib/keys.sh is
+# read in a child under "$BASH", never sourced here. Its external commands
+# are git, docker, mktemp and rm, inside the host allow-list; no host tool
+# parses any output.
+#
+# EXIT: 0 both legs hold; 1 a finding, one sentence each; 2 a refusal (usage,
+# no kit, no image, no passing run).
+set -euo pipefail
+
+readonly RE_SKIP='^NOT RUN ([^ ]+): .'
+readonly RE_COUNT='^[0-9]{1,9}$'
+readonly RE_KEY='^[0-9a-f]{64}$'
+readonly PROBE_JOB=no-such-job
+tab=$'\t'
+
+refuse() { printf '%s\n' "$1" >&2; exit 2; }
+finding() { printf '%s\n' "check-adapter: $1" >&2; findings=$((findings + 1)); }
+findings=0
+
+job="${1:-}"
+[ "$#" -eq 1 ] && [[ "$job" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] || refuse "usage: check-adapter <job>"
+
+top="$(git rev-parse --show-toplevel 2> /dev/null)" || refuse "This is not inside a git working copy, so nothing was checked."
+common="$(git rev-parse --path-format=absolute --git-common-dir)"
+sha="$(git rev-parse --verify -q 'HEAD^{commit}')" || refuse "HEAD is not a commit, so nothing was checked."
+git cat-file -e "${sha}:ci/kit/lib/keys.sh" 2> /dev/null || refuse "${sha:0:8} predates the kit, so nothing was checked."
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/cikit-check-adapter.XXXXXX")" || refuse "No temporary directory could be made, so nothing was checked."
+cleanup() { rm -rf -- "$tmp"; }
+trap cleanup EXIT
+
+# keys_call <function> [<arg>...]: HEAD's library in a child.
+git show "${sha}:ci/kit/lib/keys.sh" > "${tmp}/keys.sh"
+# shellcheck disable=SC2016
+keys_call() { "$BASH" -c '. "$1"; shift; "$@"' _ "${tmp}/keys.sh" "$@"; }
+
+m_dir=() m_arg=()
+dump="$(keys_call kit_manifest_dump "$sha")" || refuse "The ci/manifest of ${sha:0:8} could not be read, so nothing was checked."
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  m_dir+=("${line%%"$tab"*}")
+  case "$line" in *"$tab"*) m_arg+=("${line#*"$tab"}") ;; *) m_arg+=("") ;; esac
+done <<< "$dump"
+m_one() {
+  local i
+  for i in "${!m_dir[@]}"; do
+    if [ "${m_dir[$i]}" = "$1" ]; then printf '%s\n' "${m_arg[$i]}"; return 0; fi
+  done
+}
+m_job() {
+  local i out="" a
+  for i in "${!m_dir[@]}"; do
+    [ "${m_dir[$i]}" = "$1" ] || continue
+    a="${m_arg[$i]}"
+    case "$a" in "$2$tab"*) a="${a#"$2$tab"}"; out="${out:+$out }${a//"$tab"/ }" ;; esac
+  done
+  printf '%s\n' "$out"
+}
+project="$(m_one project)" adapter="$(m_one adapter)" user="$(m_one user)" check_command="$(m_one check-command)"
+user="${user:-1001}"
+[ "$(m_job job "$job")" = local ] || refuse "${job} is not a local job of ${sha:0:8}'s ci/manifest, so nothing was checked."
+[ "$job" != "$(m_one kit-job)" ] || refuse "${job} is the kit job, whose verdict is the kit's proofs and not the adapter, so nothing was checked."
+[ -z "$(m_job job "$PROBE_JOB")" ] || refuse "The manifest declares a job named ${PROBE_JOB}, the name leg (a) needs unknown, so nothing was checked."
+prefix="${project}-ci-job v1 counts "
+
+# (a) The unknown job, in the job image.
+rc=0
+line="$("$BASH" "${here}/container" image --commit "$sha" < /dev/null)" || rc=$?
+[ "$rc" -eq 0 ] || exit 2
+image="${line%% *}"
+git --literal-pathspecs archive --format=tar -o "${tmp}/tree.tar" "$sha"
+rc=0
+docker run --rm -i --network none --user "${user}:${user}" \
+  -e "CIKIT_TREE=$(git rev-parse "${sha}^{tree}")" -e "CIKIT_JOB=${PROBE_JOB}" \
+  -e "CIKIT_PROJECT=${project}" -e "CIKIT_ADAPTER=${adapter}" \
+  "$image" cikit-enter "$PROBE_JOB" < "${tmp}/tree.tar" > "${tmp}/a.log" 2>&1 || rc=$?
+reached=false counted=false
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    "The tree in the container is "*) reached=true ;;
+    "$prefix"*) counted=true ;;
+  esac
+done < "${tmp}/a.log"
+if [ "$reached" = false ]; then
+  refuse "The job image did not take ${sha:0:8}'s tree, so leg (a) could not run."
+fi
+[ "$rc" -eq 2 ] || finding "(a) ${adapter} ${PROBE_JOB} exited ${rc}, not 2."
+[ "$counted" = false ] || finding "(a) ${adapter} ${PROBE_JOB} printed a counts line."
+
+# (b) The passing run's log.
+key="$(keys_call kit_key "$sha" "$job")" || key=""
+[[ "$key" =~ $RE_KEY ]] || refuse "The ${job} key for ${sha:0:8} could not be computed, so nothing was checked."
+state="${common}/${project}-ci"
+[ -f "${state}/passed/${job}/${key}" ] && [ -f "${state}/logs/${job}-${key}.log" ] \
+  || refuse "There is no passing run of ${job} for ${sha:0:8}, so leg (b) has no log. Run ${check_command} first."
+allowed=" "
+if [ -f "${top}/ci/manifest" ]; then
+  # shellcheck disable=SC2016
+  recs="$("$BASH" -c '. "$1"; kit__manifest_records ci/manifest < "$2"' _ "${here}/../lib/keys.sh" "${top}/ci/manifest" 2> /dev/null)" || recs=""
+  while IFS= read -r line; do
+    line="${line#*"$tab"}"
+    case "$line" in "not-run-allowed$tab"*) line="${line#not-run-allowed"$tab"}"; allowed="${allowed}${line%%"$tab"*} " ;; esac
+  done <<< "$recs"
+fi
+counts=0 counts_line=""
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    "$prefix${job} "*) counts=$((counts + 1)); counts_line="$line" ;;
+    "NOT RUN "*)
+      if ! [[ "$line" =~ $RE_SKIP ]]; then
+        finding "(b) the skip line '${line}' is not NOT RUN <leg>: <reason>."
+      else
+        case "$allowed" in *" ${BASH_REMATCH[1]} "*) ;; *) finding "(b) the skip line names ${BASH_REMATCH[1]}, which the working copy's ci/manifest does not allow." ;; esac
+      fi
+      ;;
+  esac
+done < "${state}/logs/${job}-${key}.log"
+if [ "$counts" -ne 1 ]; then
+  finding "(b) the log has ${counts} counts lines for ${job}, not exactly one."
+else
+  read -r -a words <<< "$counts_line"
+  read -r -a fields <<< "$(m_job count "$job")"
+  i=4
+  for field in ${fields[@]+"${fields[@]}"}; do
+    if [ "${words[$i]:-}" != "$field" ]; then
+      finding "(b) the counts line names '${words[$i]:-nothing}' where the manifest's count line names ${field}."
+    elif ! [[ "${words[$((i + 1))]:-}" =~ $RE_COUNT ]] || [ "${words[$((i + 1))]}" -le 0 ]; then
+      finding "(b) the counts line counts ${field} as '${words[$((i + 1))]:-nothing}', not one to nine digits above zero."
+    fi
+    i=$((i + 2))
+  done
+  [ "$i" -ge "${#words[@]}" ] || finding "(b) the counts line has words beyond the manifest's count fields."
+fi
+
+if [ "$findings" -gt 0 ]; then exit 1; fi
+printf '%s\n' "check-adapter: ${adapter} keeps the contract for ${job} at ${sha:0:8}: (a) refused ${PROBE_JOB} with 2 and no counts line; (b) one counts line in field order, every skip allowed."

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# PRUNE THE RECORDS (DESIGN.md 5.5). Rewritten from the reference
+# implementation's prune_records and its two callers, the job
+# lists and the age bound now the manifest's.
+#
+#   ci/kit/bin/prune <green|local> <main tip> <true|false>
+#
+# Deletes every refs/ci/<class>/* older than `prune-days` (default 30) EXCEPT
+# the refs the main branch's tip has for the kept jobs, which stay at any age:
+# for `green`, the jobs `prune-keep-green` names; for `local`, the `local`
+# jobs. The keys and the lists are those of <main tip>'s own ci/manifest. A
+# green record's age is its commit's committer date; a local record's is its
+# tag's tagger date. A ref with no date of its kind (a local ref naming a
+# commit, not a tag) is kept and named; the plan never trusts it.
+#
+# The third word is DELETE: `false` is a DRY RUN, printing every decision and
+# removing nothing (the schedule carries no input, so a scheduled prune only
+# reports). Records are read from and deleted on CIKIT_REMOTE (default
+# origin), whose credential the caller provides; <main tip> must be a commit
+# in the local repository.
+#
+# EXIT: 0 done; 1 refused or failed; 2 usage or a bash below 4.2.
+#
+# RUNNER ONLY: bash 4.2 or later.
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] \
+    || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo "The prune needs bash 4.2 or later and this is bash ${BASH_VERSION:-unknown}, so nothing ran." >&2
+  exit 2
+fi
+set -euo pipefail
+
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+# shellcheck source-path=SCRIPTDIR source=../lib/keys.sh
+. "$here/../lib/keys.sh"
+
+usage() { echo "usage: ci/kit/bin/prune <green|local> <main tip> <true|false>" >&2; exit 2; }
+fail() { echo "::error::$*" >&2; exit 1; }
+
+[ "$#" -eq 3 ] || usage
+class="$1" tip="$2" delete="$3"
+case "$class" in
+  green) date='%(committerdate:unix)' ;;
+  local) date='%(taggerdate:unix)' ;;
+  *) usage ;;
+esac
+case "$delete" in true | false) ;; *) echo "DELETE must be true or false, not '${delete}'" >&2; exit 2 ;; esac
+remote="${CIKIT_REMOTE:-origin}"
+
+kit_manifest_load "$tip" || fail "the ci/manifest of the main branch's tip ${tip} could not be read."
+days="$KIT_PRUNE_DAYS"
+if [ "$class" = green ]; then
+  read -r -a kept_jobs <<< "$KIT_PRUNE_KEEP_GREEN"
+else
+  mapfile -t kept_jobs < <(kit_jobs local)
+fi
+
+keep=() doomed=()
+for job in ${kept_jobs[@]+"${kept_jobs[@]}"}; do
+  key="$(kit_key "$tip" "$job")" || fail "the keys of the main branch's tip ${tip} could not be computed."
+  keep+=("refs/ci/${class}/${job}/${key}")
+done
+git fetch -q --depth=1 "$remote" "+refs/ci/${class}/*:refs/ci/${class}/*" 2>/dev/null \
+  || { echo "no ${class} records to prune"; exit 0; }
+cutoff=$(( $(date -u +%s) - days * 86400 ))
+while read -r ref when; do
+  [ -n "$ref" ] || continue
+  # A ref with no date of its kind has no age by the rule, so it is kept and
+  # named; the plan never trusts it.
+  if [ -z "$when" ]; then
+    echo "::warning::${ref} has no tagger date, so its age is unknown and it was kept."
+    continue
+  fi
+  [ "$when" -lt "$cutoff" ] || continue
+  for k in ${keep[@]+"${keep[@]}"}; do [ "$k" != "$ref" ] || continue 2; done
+  doomed+=("$ref")
+done < <(git for-each-ref --format="%(refname) ${date}" "refs/ci/${class}")
+for ref in ${doomed[@]+"${doomed[@]}"}; do
+  if [ "$delete" = true ]; then echo "deleted ${ref}"; else echo "would delete ${ref}"; fi
+done
+if [ "$delete" = true ] && [ "${#doomed[@]}" -gt 0 ]; then
+  git push -q "$remote" --delete "${doomed[@]}" || fail "the old ${class} records could not be deleted."
+fi
+dry=""
+[ "$delete" = true ] || dry=', DRY RUN'
+echo "${#doomed[@]} ${class} record(s) older than ${days} days${dry}"

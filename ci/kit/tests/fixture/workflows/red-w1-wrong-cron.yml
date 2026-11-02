@@ -1,0 +1,293 @@
+# RED FIXTURE for the workflow fence (kit/README.md §2.3): green.yml with exactly one defect, a cron that is not weekly-cron.
+# THE ADOPTER SHAPE FOR THE FIXTURE MANIFEST (kit/README.md §2.3):
+# kit/tests/fixture/manifest's six jobs, wired as every adopter wires them, so
+#   python3 kit/bin/check-workflow --fixture kit/tests/fixture/workflows/
+# finds nothing in it. The red cases, one per rule, sit beside it. The action
+# shas are fixture values, the same pins the kit's own workflow uses.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Ignore every green record and run every job
+        type: boolean
+        default: false
+      task:
+        description: tests, the push jobs; weekly, the independent check
+        type: choice
+        options: [tests, weekly]
+        default: tests
+      delete:
+        description: weekly only; the prune deletes what it does not keep
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      checks: read
+    concurrency:
+      group: ci-gate-${{ github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      ref_group: ${{ steps.plan.outputs.ref_group }}
+      main: ${{ steps.plan.outputs.main }}
+      gate: ${{ steps.plan.outputs.gate }}
+      alpha: ${{ steps.plan.outputs.alpha }}
+      delta: ${{ steps.plan.outputs.delta }}
+      beta: ${{ steps.plan.outputs.beta }}
+      gamma: ${{ steps.plan.outputs.gamma }}
+      kitself: ${{ steps.plan.outputs.kitself }}
+      gate_key: ${{ steps.plan.outputs.gate_key }}
+      alpha_key: ${{ steps.plan.outputs.alpha_key }}
+      delta_key: ${{ steps.plan.outputs.delta_key }}
+      beta_key: ${{ steps.plan.outputs.beta_key }}
+      gamma_key: ${{ steps.plan.outputs.gamma_key }}
+      kitself_key: ${{ steps.plan.outputs.kitself_key }}
+    steps:
+      - name: Refuse a draft pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so no checks ran. Mark it ready for review to run them."
+          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Plan
+        id: plan
+        env:
+          CI_PLAN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_PLAN_EVENT: ${{ github.event_name }}
+          CI_PLAN_FORCE: ${{ inputs.force && 'true' || 'false' }}
+          CI_PLAN_TASK: ${{ inputs.task }}
+          CI_PLAN_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/kit/bin/plan
+      - name: The manifest lint
+        if: steps.plan.outputs.gate == 'run'
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ci/kit/bin/check-manifest --commit "$SHA"
+      - name: Record this tree green
+        if: success() && steps.plan.outputs.gate == 'run'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ steps.plan.outputs.gate_key }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ci/kit/bin/record gate "$KEY" "$SHA"
+
+  alpha:
+    name: alpha
+    needs: gate
+    if: needs.gate.outputs.alpha == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-alpha-${{ needs.gate.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+      GO_TEST_COUNT: ${{ needs.gate.outputs.main == 'true' && '-count=1' || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v3
+      - name: Cache Go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/kitfix-ci-gomod
+          key: kitfix-ci-gomod-${{ runner.os }}-${{ hashFiles('src/go.sum') }}
+      - name: Date stamp for the build cache key
+        id: gobuild
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Cache the Go build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/kitfix-ci-gobuild
+          key: kitfix-ci-gobuild-${{ runner.os }}-${{ steps.gobuild.outputs.date }}
+      - name: Cache npm's downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/kitfix-ci-npm
+          key: kitfix-ci-npm-${{ runner.os }}-${{ hashFiles('src/web/package-lock.json') }}
+      - name: The job image
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA"
+      - name: The alpha verdict
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" alpha
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.gate.outputs.alpha_key }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/record alpha "$KEY" "$SHA"
+
+  delta:
+    name: delta
+    needs: gate
+    if: needs.gate.outputs.delta == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-delta-${{ needs.gate.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+          fetch-depth: 0
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v3
+      - name: Cache Go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/kitfix-ci-gomod
+          key: kitfix-ci-gomod-${{ runner.os }}-${{ hashFiles('src/go.sum') }}
+      - name: The job image
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA"
+      - name: The delta verdict
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" delta
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.gate.outputs.delta_key }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/record delta "$KEY" "$SHA"
+
+  kitself:
+    name: kitself
+    needs: gate
+    if: needs.gate.outputs.kitself == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-kitself-${{ needs.gate.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v3
+      - name: The job image
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA" kitself
+      - name: The kit's own proofs, vendored
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" kitself
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.gate.outputs.kitself_key }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/record kitself "$KEY" "$SHA"
+
+  beta:
+    name: beta
+    needs: gate
+    if: needs.gate.outputs.beta == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-beta-${{ needs.gate.outputs.ref_group }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+      - name: The beta verdict, on the runner
+        run: bash ci/adapter.sh beta
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.gate.outputs.beta_key }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/record beta "$KEY" "$SHA"
+
+  gamma:
+    name: gamma
+    needs: gate
+    if: needs.gate.outputs.gamma == 'run' && needs.gate.outputs.main == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-gamma-${{ needs.gate.outputs.ref_group }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+      - name: Apply the obs content
+        run: echo "apply obs"
+
+  gammarecord:
+    name: gammarecord
+    needs: [gate, gamma]
+    if: needs.gate.outputs.gamma == 'run' && needs.gamma.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.gate.outputs.gamma_key }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: bash ci/kit/bin/record gamma "$KEY" "$SHA"

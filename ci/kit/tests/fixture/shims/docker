@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# THE docker SHIM (kit/README.md §6.1): records every call to $DOCKER_LOG; answers
+# info, version, image inspect/ls/rm and buildx from $SHIM_STATE/images
+# (`tag|created|id|label`); runs the launcher's reader text over the tools in
+# $TOOLS; and for a job container does what cikit-enter does (the archive from
+# stdin, only the -e names it was given) and runs the fixture's adapter.
+# Switches: SHIM_DOCKER_INFO_RC, SHIM_CONTAINER_OS, SHIM_CONTAINER_ARCH,
+# SHIM_HANG (the job container waits on a marker, for the SIGINT case).
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+PATH="$SYS_PATH"
+images="$SHIM_STATE/images"
+touch "$images"
+idof() { printf 'sha256:%s\n' "$(printf '%s' "$1" | shasum -a 256 | cut -c1-64)"; }
+case "${1:-}" in
+  info) exit "${SHIM_DOCKER_INFO_RC:-0}" ;;
+  version) echo 29.9.2; exit 0 ;;
+  image)
+    case "${2:-}" in
+      ls) repo="${*: -1}"; cut -d'|' -f1 "$images" | grep "^${repo}:" || true; exit 0 ;;
+      rm) grep -v "^$3|" "$images" > "$images.new" || true; mv "$images.new" "$images"; exit 0 ;;
+      inspect)
+        fmt="$4"; ref="$5"
+        line="$(grep "^${ref}|" "$images" | head -1)" || exit 1
+        IFS='|' read -r _t created id label <<< "$line"
+        case "$fmt" in
+          *Created*) echo "${created}|${id}|${label}" ;;
+          *Labels*) echo "${SHIM_LABEL-$label}" ;;
+          *) echo "$id" ;;
+        esac
+        exit 0
+        ;;
+    esac
+    exit 0
+    ;;
+  buildx)
+    case "${2:-}" in
+      build)
+        cat > /dev/null
+        tag="" label="" prev=""
+        for a in "$@"; do
+          [ "$prev" = -t ] && tag="$a"
+          case "$a" in io.github.aames.quokka-ci-kit.image-key=*) label="${a#*=}" ;; esac
+          prev="$a"
+        done
+        [ -z "$tag" ] || echo "${tag}|${SHIM_CREATED:-2026-11-01T00:00:00.5Z}|$(idof "$tag")|${label}" >> "$images"
+        exit "${SHIM_BUILD_RC:-0}"
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  ps | container) exit 0 ;;
+  logs) echo "fixture-postgres: the last line"; exit 0 ;;
+  network | exec | rm) exit 0 ;;
+  run) ;;
+  *) exit 0 ;;
+esac
+shift
+args=("$@")
+n="${#args[@]}"
+for a in "${args[@]}"; do case "$a" in -d) echo fixture-sidecar-id; exit 0 ;; esac; done
+if [ "$n" -ge 3 ] && [ "${args[$((n - 3))]} ${args[$((n - 2))]} ${args[$((n - 1))]}" = 'uname -s -m' ]; then
+  echo "${SHIM_CONTAINER_OS:-Linux} ${SHIM_CONTAINER_ARCH:-aarch64}"; exit 0
+fi
+for i in "${!args[@]}"; do
+  case "${args[$i]}" in
+    -c)
+      prog="${args[$((i + 1))]}"
+      case "$prog" in *'stat -c %g'*) echo 991; exit 0 ;; esac
+      PATH="$TOOLS:$SYS_PATH" exec bash -c "$prog" "${args[@]:$((i + 2))}"
+      ;;
+    cikit-enter) break ;;
+  esac
+done
+job="${args[$((n - 1))]}"
+envs=()
+i=0
+while [ "$i" -lt "$n" ]; do
+  case "${args[$i]}" in -e) envs+=("${args[$((i + 1))]}"); i=$((i + 2)) ;; *) i=$((i + 1)) ;; esac
+done
+src="$SHIM_STATE/src-${job}"
+rm -rf "$src"; mkdir -p "$src"
+adapter=""
+for e in "${envs[@]}"; do case "$e" in CIKIT_ADAPTER=*) adapter="${e#CIKIT_ADAPTER=}" ;; esac; done
+commit_env=""
+for e in "${envs[@]}"; do case "$e" in CIKIT_COMMIT=*) commit_env="${e#CIKIT_COMMIT=}" ;; esac; done
+cp "$(git rev-parse --path-format=absolute --git-common-dir)/kitfix-ci/lock/pid" "$SHIM_STATE/lockpid-${job}" 2> /dev/null || true
+if [ -n "$commit_env" ]; then
+  ( cd "$src" && git init -q . && git index-pack --stdin > /dev/null 2>&1 \
+    && git -c advice.detachedHead=false checkout -q --detach "$commit_env" ) || { echo "The pack on stdin could not be indexed, so ${job} did not run." >&2; exit 2; }
+else
+  tar -x -f - -C "$src" || { echo "The tree in the container is not the commit's tree, so ${job} did not run." >&2; exit 2; }
+fi
+extra=()
+for v in $(compgen -v | grep -E '^ADAPTER_'); do extra+=("$v=${!v}"); done
+echo "The tree in the container is ${SHIM_TREE:-fixture}, the commit's."
+cd "$src" || exit 2
+if [ "$adapter" = ci/kit/tests/run ] && [ -z "${SHIM_RUN_KIT_TESTS:-}" ]; then
+  echo "kitfix-ci-job v1 counts ${job} kit_cases 7"; exit 0
+fi
+exec env -i PATH="$TOOLS:$SYS_PATH" HOME=/nonexistent "${envs[@]}" "${extra[@]}" SHIM_STATE="$SHIM_STATE" bash "$adapter" "$job"

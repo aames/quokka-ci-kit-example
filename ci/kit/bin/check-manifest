@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+#
+# THE MANIFEST LINT (kit/README.md §3.7), run in the always-on job and on a
+# workstation at adoption (kit/README.md §7 step 4).
+#
+#   ci/kit/bin/check-manifest [--commit <rev>] [--file <path>] [--no-vendor-check]
+#
+# --commit reads <rev>:ci/manifest and checks the tree of <rev> (default
+# HEAD). --file reads a working-tree file instead (the kit's fixtures); with
+# --file and no --commit there is no tree, so the rules that read one (6's
+# existence half, 7, 8, 9's image file, 11) do not run and the last line says
+# so; with both, the file is checked against <rev>'s tree. --no-vendor-check
+# skips rule 7, for fixture manifests only; an adopter's always-on job never
+# passes it.
+#
+# Rule 1, every SHAPE, is the library's one parser (kit/lib/keys.sh,
+# kit__manifest_awk); a refusal there is printed as it stands and exits 2.
+# Rules 2 to 12 are here, in bash, each finding one sentence naming the line.
+#
+# EXIT: 0 no finding; 1 a finding; 2 the manifest cannot be parsed, or usage.
+#
+# BASH 3.2: this runs under the macOS /bin/bash, under set -f. Its own
+# external command is git; the parsing is the library's awk and bash's own
+# [[ =~ ]] and case.
+set -euo pipefail
+# No manifest word is ever glob-expanded (kit/README.md §3.7).
+set -f
+
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+# shellcheck source-path=SCRIPTDIR source=../lib/keys.sh
+. "$here/../lib/keys.sh"
+
+usage() { echo "usage: check-manifest [--commit <rev>] [--file <path>] [--no-vendor-check]" >&2; exit 2; }
+
+commit="" file="" vendor=true
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --commit) [ "$#" -ge 2 ] || usage; commit="$2"; shift 2 ;;
+    --file) [ "$#" -ge 2 ] || usage; file="$2"; shift 2 ;;
+    --no-vendor-check) vendor=false; shift ;;
+    *) usage ;;
+  esac
+done
+
+repo="${KIT_KEYS_REPO:-.}"
+tab=$'\t'
+tree=""
+if [ -z "$file" ] || [ -n "$commit" ]; then
+  tree="$(git -C "$repo" rev-parse --verify -q "${commit:-HEAD}^{commit}")" \
+    || { echo "check-manifest: ${commit:-HEAD} is not a commit in this repository." >&2; exit 2; }
+fi
+if [ -n "$file" ]; then
+  label="$file"
+  if ! [ -f "$file" ]; then echo "check-manifest: ${file} is not a file." >&2; exit 2; fi
+  text="$(< "$file")"
+else
+  label=ci/manifest
+  text="$(git -C "$repo" show "${tree}:ci/manifest" 2>/dev/null)" \
+    || { echo "check-manifest: ${tree:0:8} carries no ci/manifest." >&2; exit 2; }
+fi
+kit__manifest_load_text "$label" "$text" || exit 2
+
+findings=0
+finding() { printf '%s line %s: %s\n' "$label" "$1" "$2"; findings=$((findings + 1)); }
+finding0() { printf '%s\n' "$1"; findings=$((findings + 1)); }
+
+# Each record as LINE, DIR and the words W (an indexed array); the free text
+# of check-command, not-run-allowed and escaping-read is FREE.
+LINE="" DIR="" FREE="" W=()
+rec_at() {
+  local rec="${KIT__REC[$1]}" body
+  LINE="${rec%%"$tab"*}"
+  body="${rec#*"$tab"}"
+  DIR="${body%%"$tab"*}"
+  FREE="${body#*"$tab"}"
+  IFS="$tab" read -r -a W <<< "$body"
+}
+nrec=${#KIT__REC[@]}
+
+# The line of a singular directive, or of a job's `job` line.
+line_of() {
+  local i
+  for ((i = 0; i < nrec; i++)); do
+    rec_at "$i"
+    if [ "$DIR" = "$1" ] && { [ -z "${2:-}" ] || [ "${W[1]:-}" = "$2" ]; }; then printf '%s\n' "$LINE"; return 0; fi
+  done
+  printf '%s\n' "?"
+}
+class_of() {
+  local i
+  for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
+    [ "${KIT_JOBS[$i]}" = "$1" ] && { printf '%s\n' "${KIT_JOB_CLASS[$i]}"; return 0; }
+  done
+  printf '\n'
+}
+# covers <key path> <target>: the listed path covers itself and everything
+# under it; `.` covers the whole tree.
+covers() { [ "$1" = . ] || [ "$1" = "$2" ] || [[ "$2" == "$1"/* ]]; }
+# job_covers <job> <target>: some path of the job's key covers the target.
+job_covers() {
+  local p
+  for p in $(kit__job_words paths "$1"); do covers "$p" "$2" && return 0; done
+  return 1
+}
+in_tree() { [ -n "$tree" ] && git -C "$repo" cat-file -e "${tree}:$1" 2>/dev/null; }
+is_file() { [ "$(git -C "$repo" cat-file -t "${tree}:$1" 2>/dev/null)" = blob ]; }
+has_word() { local w; for w in $2; do [ "$w" = "$1" ] && return 0; done; return 1; }
+
+# --- Rule 2: the always-on job, the counts, the kit job -------------------
+n_always=0
+for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
+  [ "${KIT_JOB_CLASS[$i]}" = always-on ] && n_always=$((n_always + 1))
+done
+if [ "$n_always" -ne 1 ]; then
+  finding "$(line_of always-on)" "the manifest declares ${n_always} always-on jobs, and rule 2 takes exactly one."
+fi
+if [ "$(class_of "$KIT_ALWAYS_ON")" != always-on ]; then
+  finding "$(line_of always-on)" "always-on names ${KIT_ALWAYS_ON}, which no job ${KIT_ALWAYS_ON} always-on line declares."
+fi
+for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
+  case "${KIT_JOB_CLASS[$i]}" in
+    local | ci-only)
+      if [ -z "$(kit_count_fields "${KIT_JOBS[$i]}")" ]; then
+        finding "$(line_of job "${KIT_JOBS[$i]}")" "job ${KIT_JOBS[$i]} is ${KIT_JOB_CLASS[$i]} and has no count line."
+      fi
+      ;;
+  esac
+done
+kj="$KIT_KIT_JOB"
+if [ "$(class_of "$kj")" != local ]; then
+  finding "$(line_of kit-job)" "kit-job names ${kj}, which is not a local job."
+fi
+if [ "$(kit__job_words paths "$kj")" != ci ]; then
+  finding "$(line_of kit-job)" "the kit job ${kj} has paths other than exactly ci."
+fi
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  case "$DIR" in
+    pin | service | cache | install | env)
+      [ "${W[1]:-}" = "$kj" ] && finding "$LINE" "${DIR} names the kit job ${kj}, which runs the kit's proofs in the base image and takes no ${DIR}."
+      ;;
+    socket | history)
+      has_word "$kj" "${W[*]:1}" && finding "$LINE" "${DIR} names the kit job ${kj}, which runs the kit's proofs in the base image and takes no ${DIR}."
+      ;;
+  esac
+done
+
+# --- Rule 3: the code that runs a job is in its key -----------------------
+for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
+  job="${KIT_JOBS[$i]}"
+  case "${KIT_JOB_CLASS[$i]}" in local | ci-only) ;; *) continue ;; esac
+  [ "$job" = "$kj" ] && continue
+  for p in ci/kit ci/manifest "$KIT_ADAPTER"; do
+    job_covers "$job" "$p" \
+      || finding "$(line_of paths "$job")" "the key of ${job} does not cover ${p}, and the kit, the manifest and the adapter are in the key of every job the adapter runs (kit/README.md §3.7 rule 3)."
+  done
+done
+
+# The always-on job decides every other job, so its key is `.` or covers the
+# kit, the manifest and the workflow.
+for p in ci/kit ci/manifest "$KIT_WORKFLOW"; do
+  job_covers "$KIT_ALWAYS_ON" "$p" \
+    || finding "$(line_of paths "$KIT_ALWAYS_ON")" "the key of the always-on job ${KIT_ALWAYS_ON} does not cover ${p}, and it is . or covers the kit, the manifest and the workflow (rule 3)."
+done
+
+# --- Rule 4: a pin's source is in the key of every job that pins it --------
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  [ "$DIR" = pin ] || continue
+  job="${W[1]}"
+  for tool in "${W[@]:2}"; do
+    src="" srcline=""
+    for ((j = 0; j < nrec; j++)); do
+      rec="${KIT__REC[$j]}"
+      body="${rec#*"$tab"}"
+      case "$body" in "pin-source$tab$tool$tab"*) src="${body##*"$tab"}" srcline="${rec%%"$tab"*}"; break ;; esac
+    done
+    if [ -z "$src" ]; then
+      for ((j = 0; j < nrec; j++)); do
+        rec="${KIT__REC[$j]}"
+        body="${rec#*"$tab"}"
+        case "$body" in "pin-source$tab*$tab"*) src="${body##*"$tab"}" srcline="${rec%%"$tab"*}"; break ;; esac
+      done
+    fi
+    if [ -z "$src" ]; then
+      finding "$LINE" "pin names ${tool} for ${job}, which no pin-source line sources and no * line covers (rule 4)."
+    elif ! job_covers "$job" "$src"; then
+      finding "$srcline" "pin-source reads ${tool}'s pin from ${src}, which the key of ${job} does not cover, and ${job} pins ${tool} (kit/README.md §3.7 rule 4)."
+    fi
+  done
+done
+
+# --- Rule 5: the signers file is in some local job's key -------------------
+ok=false
+for job in $(kit_jobs local); do job_covers "$job" "$KIT_SIGNERS" && ok=true; done
+[ "$ok" = true ] || finding "$(line_of signers)" "signers names ${KIT_SIGNERS}, which no local job's key covers."
+
+# --- Rule 6: the escaping-read census ---------------------------------------
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  case "$DIR" in
+    escaping-read)
+      entry="$FREE"
+      ejob="${entry%%|*}"; entry="${entry#*|}"
+      efile="${entry%%|*}"; entry="${entry#*|}"
+      eout="${entry%%|*}"
+      case "$(class_of "$ejob")" in
+        local | ci-only) ;;
+        *) finding "$LINE" "escaping-read names ${ejob}, which is not a local or ci-only job."; continue ;;
+      esac
+      inside=false
+      for t in $(kit__job_words escaping-tree "$ejob"); do covers "$t" "$efile" && inside=true; done
+      [ "$inside" = true ] || finding "$LINE" "escaping-read names ${efile}, which is not inside an escaping-tree of ${ejob}."
+      case "$eout" in
+        WHOLE-TREE | NONE) ;;
+        *)
+          for p in $eout; do
+            job_covers "$ejob" "$p" || finding "$LINE" "escaping-read declares ${p}, which the key of ${ejob} does not cover."
+          done
+          ;;
+      esac
+      ;;
+    escaping-tree | escaping-scan)
+      [ -n "$tree" ] || continue
+      if [ "$DIR" = escaping-tree ]; then set -- "${W[@]:2}"; else set -- "${W[2]}"; fi
+      for p in "$@"; do
+        in_tree "$p" || finding "$LINE" "${DIR} names ${p}, which does not exist at ${tree:0:8}."
+      done
+      ;;
+  esac
+done
+
+# --- Rule 7: the vendored tree is the release's ------------------------------
+if [ "$vendor" = true ] && [ -n "$tree" ]; then
+  want="$(git -C "$repo" show "${tree}:ci/KIT-VERSION" 2>/dev/null)" || want=""
+  got="$(git -C "$repo" rev-parse --verify -q "${tree}:ci/kit")" || got=""
+  line_tree=""
+  while IFS= read -r l; do
+    case "$l" in "tree "*) line_tree="${l#tree }" ;; esac
+  done <<< "$want"
+  if [ -z "$want" ]; then
+    finding0 "ci/KIT-VERSION is absent at ${tree:0:8}, so the vendored ci/kit cannot be checked (rule 7)."
+  elif [ -z "$got" ] || [ "$got" != "$line_tree" ]; then
+    finding0 "ci/kit at ${tree:0:8} is tree ${got:-absent}, where ci/KIT-VERSION names ${line_tree:-no tree} (rule 7)."
+  fi
+fi
+
+# --- Rule 8: the hook is the kit's shim --------------------------------------
+if [ -n "$tree" ]; then
+  hook="$(git -C "$repo" rev-parse --verify -q "${tree}:.githooks/pre-push")" || hook=""
+  shim="$(git -C "$repo" rev-parse --verify -q "${tree}:ci/kit/hooks/pre-push.shim")" || shim=""
+  if [ -z "$hook" ] || [ "$hook" != "$shim" ]; then
+    finding0 ".githooks/pre-push at ${tree:0:8} is not byte-equal to ci/kit/hooks/pre-push.shim (rule 8, kit/README.md §2.4)."
+  fi
+fi
+
+# --- Rule 9: the image, the sockets, the history, one service and install ---
+for p in $KIT_IMAGE_PATH; do
+  for job in $(kit_jobs local); do
+    [ "$job" = "$kj" ] && continue
+    job_covers "$job" "$p" || finding "$(line_of image-path)" "image-path names ${p}, which the key of ${job} does not cover."
+  done
+done
+ok=false
+for p in $KIT_IMAGE_PATH; do covers "$p" "$KIT_IMAGE" && ok=true; done
+[ "$ok" = true ] || finding "$(line_of image)" "image names ${KIT_IMAGE}, which is under no image-path PATH."
+# digested <ref>: a DIGESTED IMAGE whose name does not start with -.
+digested() {
+  [[ "$1" =~ ^([a-z0-9.-]+(:[0-9]+)?/)?[a-z0-9._/-]+(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?@sha256:[0-9a-f]{64}$ ]] && [[ "$1" != -* ]]
+}
+# stage_or_digested <ref>: a stage defined earlier in the image file (by its
+# AS name or its index) or a DIGESTED IMAGE.
+stage_or_digested() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -lt "$nstage" ] && return 0
+  has_word "$1" "$stages" && return 0
+  digested "$1"
+}
+if [ -n "$tree" ] && is_file "$KIT_IMAGE"; then
+  base=0 fl=0 at=0 l="" stages="" nstage=0
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    fl=$((fl + 1))
+    # A `# syntax=` parser directive pulls the frontend image itself.
+    if [[ "$raw" =~ ^[[:space:]]*#[[:space:]]*[Ss][Yy][Nn][Tt][Aa][Xx][[:space:]]*=[[:space:]]*([^[:space:]]*) ]]; then
+      ref="${BASH_REMATCH[1]}"
+      digested "$ref" \
+        || finding0 "${KIT_IMAGE} line ${fl}: # syntax=${ref} names no digested image, and the frontend is pinned like every image (rule 9)."
+      continue
+    fi
+    # One instruction per logical line: a trailing backslash continues it.
+    [ -n "$l" ] || at="$fl"
+    if [[ "$raw" =~ ^(.*)\\[[:space:]]*$ ]]; then l="${l}${BASH_REMATCH[1]} "; continue; fi
+    l="${l}${raw}"
+    read -r -a iw <<< "$l"
+    set -- ${iw[@]+"${iw[@]}"}
+    l=""
+    [ "$#" -gt 0 ] || continue
+    case "$1" in
+      [Ff][Rr][Oo][Mm])
+        shift
+        ref="" name=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --*) ;;
+            [Aa][Ss]) [ -n "$ref" ] && [ "$#" -ge 2 ] && name="$2" ;;
+            *) [ -n "$ref" ] || ref="$1" ;;
+          esac
+          shift
+        done
+        # SC2016: the literal text ${CIKIT_BASE} is what the line must hold.
+        # shellcheck disable=SC2016
+        if [ "$ref" = '${CIKIT_BASE}' ]; then
+          base=$((base + 1))
+        elif ! digested "$ref"; then
+          finding0 "${KIT_IMAGE} line ${at}: FROM ${ref} names no digested image, and every FROM but the one \${CIKIT_BASE} does (rule 9)."
+        fi
+        nstage=$((nstage + 1))
+        [ -z "$name" ] || stages="$stages $name"
+        ;;
+      [Cc][Oo][Pp][Yy])
+        for w in "$@"; do
+          case "$w" in
+            --from=*)
+              stage_or_digested "${w#--from=}" \
+                || finding0 "${KIT_IMAGE} line ${at}: COPY --from=${w#--from=} names neither an earlier stage nor a digested image (rule 9)." ;;
+          esac
+        done
+        ;;
+      [Rr][Uu][Nn])
+        for w in "$@"; do
+          case "$w" in
+            --mount=*)
+              IFS=, read -r -a kv <<< "${w#--mount=}"
+              for f in ${kv[@]+"${kv[@]}"}; do
+                case "$f" in
+                  from=*)
+                    stage_or_digested "${f#from=}" \
+                      || finding0 "${KIT_IMAGE} line ${at}: RUN --mount=...${f}... names neither an earlier stage nor a digested image (rule 9)." ;;
+                esac
+              done
+              ;;
+          esac
+        done
+        ;;
+    esac
+  done <<< "$(git -C "$repo" show "${tree}:${KIT_IMAGE}")"
+  [ "$base" -eq 1 ] || finding0 "${KIT_IMAGE} holds ${base} FROM \${CIKIT_BASE} lines, and rule 9 takes exactly one."
+fi
+nsvc="" ninst="" socketed=""
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  [ "$DIR" = socket ] && socketed="$socketed ${W[*]:1}"
+done
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  case "$DIR" in
+    socket | history)
+      for job in "${W[@]:1}"; do
+        [ "$(class_of "$job")" = local ] || finding "$LINE" "${DIR} names ${job}, which is not a local job."
+      done
+      ;;
+    service)
+      has_word "${W[1]}" "$nsvc" && finding "$LINE" "service names ${W[1]} a second time, and a job takes one service at most."
+      nsvc="$nsvc ${W[1]}"
+      has_word "${W[1]}" "$socketed" && finding "$LINE" "service names ${W[1]}, which holds the socket, and a socket job takes no service (rule 9)."
+      ;;
+    install)
+      has_word "${W[1]}" "$ninst" && finding "$LINE" "install names ${W[1]} a second time, and a job takes one install at most."
+      ninst="$ninst ${W[1]}"
+      has_word "${W[1]}" "$socketed" && finding "$LINE" "install names ${W[1]}, which holds the socket, and an install's lifecycle scripts would run beside the socket and the host network (rule 9)."
+      ;;
+  esac
+done
+
+# --- Rule 10: probes, environment names, the closed kinds ---------------------
+pinned="$(for job in "${KIT_JOBS[@]}"; do kit_pin_tools "$job"; done)"
+urlenv=""
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  if [ "$DIR" = service ]; then
+    for ((k = 3; k < ${#W[@]}; k += 2)); do [ "${W[$k]}" = url-env ] && urlenv="$urlenv ${W[$((k + 1))]}"; done
+  fi
+done
+for ((i = 0; i < nrec; i++)); do
+  rec_at "$i"
+  case "$DIR" in
+    probe)
+      has_word "${W[1]}" "$pinned" || finding "$LINE" "probe names ${W[1]}, which no job pins."
+      ;;
+    env)
+      for v in "${W[@]:2}"; do
+        if kit_env_reserved "$v"; then
+          finding "$LINE" "env names ${v}, which the kit reserves."
+        elif has_word "$v" "$urlenv"; then
+          finding "$LINE" "env names ${v}, which a service's url-env sets."
+        fi
+      done
+      ;;
+    cache)
+      for v in "${W[@]:2}"; do
+        case "$v" in gomod | gobuild | npm) ;; *) finding "$LINE" "cache names the kind ${v}, which is not gomod, gobuild or npm." ;; esac
+      done
+      ;;
+    install)
+      [ "${W[2]}" = npm-ci ] || finding "$LINE" "install names the kind ${W[2]}, which is not npm-ci."
+      ;;
+    service)
+      [ "${W[2]}" = postgres ] || finding "$LINE" "service names the kind ${W[2]}, which is not postgres."
+      ;;
+    escaping-scan)
+      case "${W[1]}" in go | ts) ;; *) finding "$LINE" "escaping-scan names the kind ${W[1]}, which is not go or ts." ;; esac
+      ;;
+    pin-source)
+      case "${W[2]}" in
+        toolchain-line | first-line | readonly-version) ;;
+        *) finding "$LINE" "pin-source names the kind ${W[2]}, which is not toolchain-line, first-line or readonly-version." ;;
+      esac
+      ;;
+  esac
+done
+
+# --- Rule 11: the named files exist ------------------------------------------
+if [ -n "$tree" ]; then
+  for d in adapter workflow image signers plan-extension; do
+    case "$d" in
+      adapter) p="$KIT_ADAPTER" ;; workflow) p="$KIT_WORKFLOW" ;; image) p="$KIT_IMAGE" ;;
+      signers) p="$KIT_SIGNERS" ;; plan-extension) p="$KIT_PLAN_EXTENSION" ;;
+    esac
+    [ -n "$p" ] || continue
+    is_file "$p" || finding "$(line_of "$d")" "${d} names ${p}, which is not a file at ${tree:0:8}."
+  done
+fi
+
+# --- Rule 12: the weekly minute, the kept jobs --------------------------------
+minute="${KIT_WEEKLY_CRON%% *}"
+[[ "$minute" =~ ^0+$ ]] && finding "$(line_of weekly-cron)" "weekly-cron runs at minute 0, the hour every other schedule picks, and rule 12 takes any other minute."
+for job in $KIT_PRUNE_KEEP_GREEN; do
+  [ -n "$(class_of "$job")" ] || finding "$(line_of prune-keep-green)" "prune-keep-green names ${job}, which no job line declares."
+done
+
+if [ "$findings" -gt 0 ]; then
+  exit 1
+fi
+if [ -n "$tree" ]; then
+  if [ "$vendor" = true ]; then
+    echo "check-manifest: ${label} at ${tree:0:8} holds rules 1 to 12."
+  else
+    echo "check-manifest: ${label} at ${tree:0:8} holds rules 1 to 6 and 8 to 12; rule 7 did not run (--no-vendor-check)."
+  fi
+else
+  echo "check-manifest: ${label} holds rules 1 to 5, 6's census, 9's directives, 10 and 12; rules 6's existence half, 7, 8, 9's image file and 11 read a tree, and --file names none, so they did not run."
+fi

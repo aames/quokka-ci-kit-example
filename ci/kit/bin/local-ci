@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+#
+# THE LOCAL SIDE OF LOCAL EVIDENCE (DESIGN.md 6.2 to 6.4; kit/README.md §2.2,
+# §3.2, §3.5). Derived from the author's private reference implementation.
+#
+#   ci/kit/bin/local-ci run --commit <rev> <job>...
+#   ci/kit/bin/local-ci sign --commit <rev> <job>...
+#   ci/kit/bin/local-ci push [--remote <name>] --commit <rev> <job>...
+#
+# <job> is a `local` or `ci-only` job of the COMMIT's ci/manifest. The
+# adopter's check command (the manifest's `check-command`) is
+# `run --commit HEAD <its local jobs>`; ci/kit/bin/pre-push calls all three
+# subcommands.
+#
+# A CI-ONLY JOB IS CI-ONLY ON EVERY HOST: `run` names it only to refuse it,
+# in one sentence, before any Docker call, and no local record vouches for it.
+#
+# THE JOBS RUN IN THE JOB IMAGE. Each job runs as
+# `container run --commit <sha> <job>`, this script's sibling launcher, which
+# streams the commit's archive into a container of the job image (the base
+# for the kit job), where cikit-enter checks the tree and runs the verdict and
+# nothing else. The commit, never the working copy, is what runs; no host
+# worktree is made. Output goes by redirection to
+# <common dir>/<project>-ci/logs/<job>-<key>.log and the exit status is read
+# directly, never through a pipe. Exit 0 writes the passing entry
+# <common dir>/<project>-ci/passed/<job>/<key>, the facts block; any other
+# status prints the log's last 40 lines and writes nothing.
+#
+# WHAT STAYS ON THIS HOST: the keys, the passing-entry cache, the lock, the
+# logs, the facts, the decision of pass or fail, `sign` and `push`. The
+# commit's ci/kit/lib/keys.sh is read only in a child under "$BASH"
+# (keys_call), never sourced into this shell, and every child this script
+# starts runs under "$BASH". The commit's manifest is read once, as that
+# library's dump, into indexed arrays.
+#
+# BASH 3.2: this runs under the macOS /bin/bash. No declare -A, mapfile,
+# readarray, case-changing expansions, [[ -v ]], wait -n, negative subscripts
+# or coproc. Its external commands are the host allow-list (git, docker,
+# mkdir, mv, rm, mktemp, cat, date, uname, sleep, kill, tail, head, tr, wc,
+# and shasum -a 256 or sha256sum), and no host tool parses any output: the
+# parsing is bash's own [[ =~ ]], case and read.
+#
+# PREFLIGHT, BEFORE THE LOCK: Docker answers `docker info`; the launcher's
+# `image` finds or builds the image of each job (announcing a build in one
+# line); the launcher's `versions` runs the reader in one container and each
+# pinned tool of the named jobs must answer the commit's pin, read AS DATA
+# through the commit's library (`kit_pin_at`, the pins the plan checks a
+# record against), one leading v dropped from each side. This script never
+# starts, stops or reconfigures Docker Desktop.
+#
+# ONE RUN AT A TIME: a lock under <common dir>/<project>-ci/, shared by every
+# worktree of this clone. A second run waits up to the manifest's
+# `lock-wait-minutes`, one line a tick, then refuses naming the holder's
+# process id. A lock whose holder is no longer running is taken over by
+# renaming it aside, removing what moved and going back to mkdir, so the lock
+# is only ever made by mkdir and of two waiters one wins. CIKIT_LOCK_WAIT_S
+# and CIKIT_LOCK_TICK_S shorten the wait for the harness.
+#
+# A SKIP LINE FAILS THE JOB FOR RECORD PURPOSES unless its leg is a
+# `not-run-allowed` LEG of the working copy's ci/manifest (the plan reads
+# main's); an allowed leg becomes a `not_run <leg>` line in the facts. A skip
+# line has ONE SHAPE, anchored at the start of a line: `NOT RUN <leg>: <reason>`.
+#
+# THE FACTS ARE `<project>-local-ci v<local-epoch>`: `platform` is the job
+# container's (uname inside the image), `host` this machine's and `image` the
+# local image id the job ran in, both audit only; the pin lines are the
+# image's answers; the counts are the last `<project>-ci-job v1 counts <job>`
+# line of the log, every field of the job's `count` line, one to nine digits,
+# above zero.
+#
+# SIGN refuses a key with no passing entry, so a record exists only after the
+# job's verdict exited 0. It makes an annotated tag object SSH-signed with
+# git's user.signingkey (namespace git), its object the commit the entry
+# tested, its message the facts block, as a temporary tag it deletes at once,
+# and points refs/ci/local/<job>/<key> at it. It never writes a refs/tags/
+# name that survives and never writes under refs/ci/green/.
+#
+# PUSH sends <object>:refs/ci/local/<job>/<key> with --no-verify to --remote,
+# else CIKIT_REMOTE, else origin. A rejection because that ref already exists
+# on the remote is success: another push proved the same tree.
+#
+# EXIT: 0 every job passed (or signed, or pushed); 1 a job failed or a push
+# failed; 2 a refusal (usage, the kit, Docker, the image, a pin, the lock, no
+# passing entry).
+set -euo pipefail
+
+readonly RE_KEY='^[0-9a-f]{64}$'
+readonly RE_SKIP='^NOT RUN ([^ ]+): '
+readonly RE_COUNT='^[0-9]{1,9}$'
+readonly RE_PID='^[0-9]+$'
+readonly RE_NAME='^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+
+say() { printf '%s\n' "$*"; }
+refuse() { printf '%s\n' "$1" >&2; exit 2; }
+
+usage() {
+  echo "usage: local-ci run --commit <rev> <job>... | sign --commit <rev> <job>... | push [--remote <name>] --commit <rev> <job>..." >&2
+  exit 2
+}
+
+# sha256_of <file>: the file's sha256, the first word of the tool's answer.
+sha256_of() {
+  local out
+  if command -v sha256sum > /dev/null 2>&1; then
+    out="$(sha256sum "$1")"
+  else
+    out="$(shasum -a 256 "$1")"
+  fi
+  printf '%s\n' "${out%% *}"
+}
+
+# --- arguments -------------------------------------------------------------------
+
+cmd="${1:-}"
+[ -n "$cmd" ] || usage
+shift
+remote="${CIKIT_REMOTE:-origin}"
+rev=""
+jobs=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --commit) [ "$#" -ge 2 ] || usage; rev="$2"; shift 2 ;;
+    --remote) [ "$cmd" = push ] && [ "$#" -ge 2 ] || usage; remote="$2"; shift 2 ;;
+    -*) usage ;;
+    *)
+      [[ "$1" =~ $RE_NAME ]] || refuse "$1 is not a job name, so nothing ran."
+      case " ${jobs[*]-} " in *" $1 "*) ;; *) jobs+=("$1") ;; esac
+      shift
+      ;;
+  esac
+done
+case "$cmd" in run | sign | push) ;; *) usage ;; esac
+[ -n "$rev" ] && [ "${#jobs[@]}" -gt 0 ] || usage
+
+common="$(git rev-parse --path-format=absolute --git-common-dir)" \
+  || refuse "This is not inside a git repository, so nothing ran."
+top="$(git rev-parse --show-toplevel 2> /dev/null)" || top=""
+sha="$(git rev-parse --verify -q "${rev}^{commit}")" || refuse "${rev} is not a commit here, so nothing ran."
+# A hook runs with git's own variables set; the launcher's git calls must
+# answer for this clone as itself, so none of them leak further.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GITHUB_ACTIONS
+git cat-file -e "${sha}:ci/kit/lib/keys.sh" 2> /dev/null || refuse "${sha:0:8} predates the kit, so nothing ran."
+
+# The launcher and the library this script reads the working copy's manifest
+# with are its siblings, never the commit's copies.
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+launcher="${here}/container"
+
+# keys_call <commit> <function> [<arg>...]: runs <function> from THAT
+# commit's ci/kit/lib/keys.sh in a child bash and prints what it prints. The
+# commit's file is never sourced into this shell, so nothing it defines can
+# replace a function of the driver's.
+keys_file_prefix="${TMPDIR:-/tmp}/cikit-keys"
+keys_call() {
+  local commit="$1" file rc=0
+  shift
+  file="$(mktemp "${keys_file_prefix}.XXXXXX")" || return 1
+  git show "${commit}:ci/kit/lib/keys.sh" > "$file" 2> /dev/null || { rm -f -- "$file"; return 1; }
+  # SC2016: the program is in single quotes; its $1 and $@ belong to the child.
+  # shellcheck disable=SC2016
+  "$BASH" -c '. "$1"; shift; "$@"' _ "$file" "$@" || rc=$?
+  rm -f -- "$file"
+  return "$rc"
+}
+
+# --- the commit's manifest, read once -------------------------------------------
+#
+# m_dir[i] is a dump line's directive and m_arg[i] the rest, tab-separated.
+tab=$'\t'
+m_dir=() m_arg=()
+dump="$(keys_call "$sha" kit_manifest_dump "$sha")" || refuse "The ci/manifest of ${sha:0:8} could not be read, so nothing ran."
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  m_dir+=("${line%%"$tab"*}")
+  case "$line" in *"$tab"*) m_arg+=("${line#*"$tab"}") ;; *) m_arg+=("") ;; esac
+done <<< "$dump"
+m_one() {
+  local i
+  for i in "${!m_dir[@]}"; do
+    if [ "${m_dir[$i]}" = "$1" ]; then printf '%s\n' "${m_arg[$i]}"; return 0; fi
+  done
+  return 0
+}
+m_job() {
+  local i out="" a
+  for i in "${!m_dir[@]}"; do
+    [ "${m_dir[$i]}" = "$1" ] || continue
+    a="${m_arg[$i]}"
+    case "$a" in "$2$tab"*) a="${a#"$2$tab"}"; out="${out:+$out }${a//"$tab"/ }" ;; esac
+  done
+  printf '%s\n' "$out"
+}
+m_class() {
+  local i
+  for i in "${!m_dir[@]}"; do
+    if [ "${m_dir[$i]}" = job ] && [ "${m_arg[$i]%%"$tab"*}" = "$1" ]; then printf '%s\n' "${m_arg[$i]#*"$tab"}"; return 0; fi
+  done
+  return 0
+}
+
+project="$(m_one project)"
+[[ "$project" =~ ^[a-z][a-z0-9]{1,15}$ ]] || refuse "The ci/manifest of ${sha:0:8} names no project, so nothing ran."
+keys_file_prefix="${TMPDIR:-/tmp}/${project}-ci-keys"
+format="${project}-local-ci v$(m_one local-epoch)"
+check_command="$(m_one check-command)"
+kit_job="$(m_one kit-job)"
+lock_minutes="$(m_one lock-wait-minutes)"
+LOCK_WAIT_S="${CIKIT_LOCK_WAIT_S:-$((${lock_minutes:-30} * 60))}"
+LOCK_TICK_S="${CIKIT_LOCK_TICK_S:-60}"
+readonly RE_IMAGE_LINE="^${project}-ci-(job|base):[0-9a-f]{64} (sha256:[0-9a-f]{64})$"
+
+for job in "${jobs[@]}"; do
+  case "$(m_class "$job")" in
+    local) ;;
+    ci-only)
+      # Refused before anything else, Docker included.
+      [ "$cmd" != run ] || refuse "${job} runs in CI only, so it did not run here. The pull request runs it."
+      ;;
+    *) refuse "${job} is not a local or ci-only job of ${sha:0:8}'s ci/manifest, so nothing ran." ;;
+  esac
+done
+
+base="${common}/${project}-ci"
+mkdir -p "${base}/logs" "${base}/passed"
+
+# key_at <commit> <job>: the job's key, by THAT commit's library, as the plan
+# on that commit computes it.
+key_at() {
+  local rc=0 out
+  out="$(keys_call "$1" kit_key "$1" "$2")" || rc=$?
+  [ "$rc" -eq 0 ] && [[ "$out" =~ $RE_KEY ]] || return 1
+  printf '%s\n' "$out"
+}
+pin_at() { keys_call "$sha" kit_pin_at "$sha" "$1"; }
+
+# fact <file> <name>: the value of the first `<name> <value>` line.
+fact() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$2 "*) printf '%s\n' "${line#"$2 "}"; return 0 ;; esac
+  done < "$1"
+  return 0
+}
+
+# --- sign --------------------------------------------------------------------------
+
+cmd_sign() {
+  local i job key entry ref obj tmp made keys=()
+  # Every key must have its passing entry before anything is signed.
+  for i in "${!jobs[@]}"; do
+    job="${jobs[$i]}"
+    key="$(key_at "$sha" "$job")" || refuse "The ${job} key for ${sha:0:8} could not be computed, so nothing was signed."
+    entry="${base}/passed/${job}/${key}"
+    [ -f "$entry" ] || refuse "There is no passing run of ${job} for ${sha:0:8}, so nothing was signed. Run ${check_command} first."
+    [ "$(fact "$entry" job)" = "$job" ] && [ "$(fact "$entry" key)" = "$key" ] \
+      || refuse "The passing entry for ${job} at ${key:0:8} does not name that job and key, so nothing was signed."
+    keys[i]="$key"
+  done
+  [ -n "$(git config --get user.signingkey || true)" ] \
+    || refuse "Git has no user.signingkey, so nothing was signed. Set it to your SSH signing key and try again."
+  for i in "${!jobs[@]}"; do
+    job="${jobs[$i]}"
+    key="${keys[$i]}"
+    entry="${base}/passed/${job}/${key}"
+    ref="refs/ci/local/${job}/${key}"
+    if git rev-parse --verify -q "$ref" > /dev/null; then
+      say "${job}: already signed at ${ref}."
+      continue
+    fi
+    # The tag's object is the commit the entry tested; a later commit with
+    # the same key is the same tree.
+    obj="$(fact "$entry" commit)"
+    [ "$(git cat-file -t "$obj" 2> /dev/null || true)" = commit ] \
+      || refuse "The commit ${obj:0:8} that ${job} passed on is not in this repository, so nothing was signed."
+    tmp="${project}-ci-local-${job}-${key:0:12}-$$"
+    if git rev-parse --verify -q "refs/tags/${tmp}" > /dev/null; then
+      refuse "A tag named ${tmp} already exists, so ${job} was not signed."
+    fi
+    if ! git -c gpg.format=ssh tag -s --cleanup=verbatim -F "$entry" "$tmp" "$obj" > /dev/null; then
+      refuse "Git could not sign the ${job} record with your signing key, so nothing more was signed."
+    fi
+    made="$(git rev-parse --verify "refs/tags/${tmp}")"
+    git update-ref "$ref" "$made" "" || { git update-ref -d "refs/tags/${tmp}" "$made"; refuse "The ${job} record could not be written at ${ref}."; }
+    git update-ref -d "refs/tags/${tmp}" "$made"
+    say "${job}: signed ${ref} (tag object ${made:0:12}, commit ${obj:0:8})."
+  done
+}
+
+# --- push ------------------------------------------------------------------------
+
+cmd_push() {
+  local job key ref obj rc line failed=0 err="${base}/logs/push-$$.err"
+  for job in "${jobs[@]}"; do
+    key="$(key_at "$sha" "$job")" || refuse "The ${job} key for ${sha:0:8} could not be computed, so nothing was pushed."
+    ref="refs/ci/local/${job}/${key}"
+    obj="$(git rev-parse --verify -q "$ref")" || refuse "${job} for ${sha:0:8} is not signed, so nothing was pushed."
+    rc=0
+    git push --no-verify --quiet "$remote" "${obj}:${ref}" 2> "$err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      say "${job}: pushed ${ref} to ${remote}."
+    elif [ -n "$(git ls-remote "$remote" "$ref" 2> /dev/null || true)" ]; then
+      say "${job}: ${remote} already has ${ref}, so the record stands."
+    else
+      while IFS= read -r line || [ -n "$line" ]; do printf '    %s\n' "$line" >&2; done < "$err"
+      printf '%s\n' "The ${job} record could not be pushed to ${remote}. Check the connection and try again." >&2
+      failed=1
+    fi
+    rm -f -- "$err"
+  done
+  return "$failed"
+}
+
+# --- run -------------------------------------------------------------------------
+
+lock_held=false
+lock="${base}/lock"
+
+cleanup() {
+  if [ "$lock_held" = true ] && [ "$(cat "${lock}/pid" 2> /dev/null || true)" = "$$" ]; then
+    rm -rf -- "$lock"
+  fi
+}
+
+docker_check() {
+  if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then return 0; fi
+  refuse "Docker is not running, so ${jobs[*]} did not run. Start Docker and push again, or push with --no-verify and the pull request will run it."
+}
+
+lock_take() {
+  local waited=0 holder aside
+  while ! mkdir "$lock" 2> /dev/null; do
+    holder="$(cat "${lock}/pid" 2> /dev/null || true)"
+    if [[ "$holder" =~ $RE_PID ]] && ! kill -0 "$holder" 2> /dev/null; then
+      # Its holder is gone: the lock is stale. It is renamed aside, which of
+      # two waiters only one can do, what moved is removed, and the lock is
+      # made again by mkdir; a pid is never written into a lock this run did
+      # not make. A failed rename waits as below.
+      aside="${lock}.stale-$$-${RANDOM}"
+      if mv "$lock" "$aside" 2> /dev/null; then
+        rm -rf -- "$aside"
+        continue
+      fi
+    fi
+    if [ "$waited" -ge "$LOCK_WAIT_S" ]; then
+      refuse "Another check run, process ${holder:-unknown}, still holds the lock after $((LOCK_WAIT_S / 60)) minutes, so ${jobs[*]} did not run. Let it finish and try again, or push with --no-verify and the pull request will run it."
+    fi
+    say "Waiting for the check run in process ${holder:-unknown} to finish ($((waited / 60)) of $((LOCK_WAIT_S / 60)) minutes)."
+    sleep "$LOCK_TICK_S"
+    waited=$((waited + LOCK_TICK_S))
+  done
+  lock_held=true
+  printf '%s\n' "$$" > "${lock}/pid"
+}
+
+# platform_of <uname -s> <uname -m>: `<os>/<arch>`, lower-case system;
+# x86_64 is amd64, aarch64 is arm64.
+platform_of() {
+  local os="$1" arch="$2"
+  case "$os" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) os="$(tr '[:upper:]' '[:lower:]' <<< "$os")" ;;
+  esac
+  case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+  printf '%s/%s\n' "$os" "$arch"
+}
+
+# The image's answers to the reader, as two lists side by side, and the
+# lookup over them.
+answer_tools=()
+answer_versions=()
+answer_of() {
+  local i
+  for i in "${!answer_tools[@]}"; do
+    if [ "${answer_tools[$i]}" = "$1" ]; then printf '%s\n' "${answer_versions[$i]}"; return 0; fi
+  done
+  return 0
+}
+
+# The legs the working copy's ci/manifest allows to be skipped, read once by
+# the sibling library's one parser in a child (nothing when the file is
+# absent or refused, so every skip fails the record).
+allowed_legs=()
+read_allowed() {
+  local recs rec body
+  [ -n "$top" ] && [ -f "${top}/ci/manifest" ] || return 0
+  # shellcheck disable=SC2016
+  recs="$("$BASH" -c '. "$1"; kit__manifest_records ci/manifest < "$2"' _ "${here}/../lib/keys.sh" "${top}/ci/manifest" 2> /dev/null)" || return 0
+  while IFS= read -r rec; do
+    body="${rec#*"$tab"}"
+    case "$body" in
+      "not-run-allowed$tab"*) body="${body#not-run-allowed"$tab"}"; allowed_legs+=("${body%%"$tab"*}") ;;
+    esac
+  done <<< "$recs"
+}
+
+# scan_log <job> <log>: sets counts_line to the last counts line of that job
+# and skip_legs to the leg of each anchored skip line, one per line. The leg
+# holds no space but may hold a colon (`<harness path>:<leg name>`), and a
+# colon straight after RUN does not match.
+counts_line=""
+skip_legs=""
+scan_log() {
+  local line prefix="${project}-ci-job v1 counts $1 "
+  counts_line=""
+  skip_legs=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$prefix"*) counts_line="$line" ;;
+      "NOT RUN "*)
+        if [[ "$line" =~ $RE_SKIP ]]; then skip_legs="${skip_legs}${BASH_REMATCH[1]}"$'\n'; fi
+        ;;
+    esac
+  done < "$2"
+}
+
+# legs_allowed <job>: each allowed leg of skip_legs, once; non-zero with the
+# sentence when one is not allowed.
+legs_allowed() {
+  local leg entry matched hit=" "
+  while IFS= read -r leg; do
+    [ -n "$leg" ] || continue
+    matched=""
+    for entry in ${allowed_legs[@]+"${allowed_legs[@]}"}; do
+      if [ "$entry" = "$leg" ]; then matched="$leg"; break; fi
+    done
+    if [ -z "$matched" ]; then
+      printf '%s\n' "$1 passed, but its log says ${leg} did not run, so no record was written." >&2
+      return 1
+    fi
+    case "$hit" in *" ${matched} "*) ;; *) hit="${hit}${matched} "; printf '%s\n' "$matched" ;; esac
+  done <<< "$skip_legs"
+}
+
+# count_of <field>: that field's value on counts_line, whose words after the
+# fourth are `<field> <value>` pairs.
+count_of() {
+  local words i
+  read -r -a words <<< "$counts_line"
+  i=4
+  while [ $((i + 1)) -lt "${#words[@]}" ]; do
+    if [ "${words[$i]}" = "$1" ]; then printf '%s\n' "${words[$((i + 1))]}"; return 0; fi
+    i=$((i + 2))
+  done
+  return 0
+}
+
+# facts <job> <key> <log> <started> <duration> <image id>: the facts block,
+# or non-zero with a sentence when the log holds no usable counts line or an
+# unlisted skip.
+facts() {
+  local job="$1" key="$2" log="$3" tool field value legs leg
+  scan_log "$job" "$log"
+  if [ -z "$counts_line" ]; then
+    printf '%s\n' "${job} passed, but its log has no counts line, so no record was written." >&2
+    return 1
+  fi
+  legs="$(legs_allowed "$job")" || return 1
+  printf '%s\n' "$format" "job ${job}" "key ${key}" "commit ${sha}" "started $4" "duration_s $5" \
+    "platform ${container_platform}" "host ${host_platform}" "docker ${docker_version}" "image $6"
+  for tool in $(m_job pin "$job"); do
+    printf '%s %s\n' "$tool" "$(answer_of "$tool")"
+  done
+  for field in $(m_job count "$job"); do
+    value="$(count_of "$field")"
+    # The plan's rule: one to nine digits, above zero.
+    if ! [[ "$value" =~ $RE_COUNT ]] || [ "$value" -le 0 ]; then
+      printf '%s\n' "${job} passed, but it counted ${field} as ${value:-nothing}, so no record was written." >&2
+      return 1
+    fi
+    printf '%s %s\n' "$field" "$value"
+  done
+  if [ -n "$legs" ]; then
+    while IFS= read -r leg; do printf 'not_run %s\n' "$leg"; done <<< "$legs"
+  fi
+  printf 'log_sha256 %s\n' "$(sha256_of "$log")"
+}
+
+iso_now() {
+  local s
+  s="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  printf '%s:%s\n' "${s:0:22}" "${s:22}"
+}
+
+container_platform="" host_platform="" docker_version=""
+
+# image_line <job or empty>: the launcher's `image` for that job's image (the
+# base for the kit job), its id in $got.
+got=""
+image_line() {
+  local rc=0 line
+  line="$("$BASH" "$launcher" image --commit "$sha" ${1:+"$1"} < /dev/null)" || rc=$?
+  # The launcher has said why in its own sentence.
+  [ "$rc" -eq 0 ] || exit 2
+  [[ "$line" =~ $RE_IMAGE_LINE ]] || refuse "The launcher named no image for ${sha:0:8}, so nothing ran."
+  got="${BASH_REMATCH[2]}"
+}
+
+cmd_run() {
+  local i job tool pin key log rc started t0 secs entry answers out os arch kit_image="" job_image=""
+  local keys=() images=() failed=() passed=() pinned=()
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  [ -f "$launcher" ] || refuse "There is no launcher at ${launcher}, so nothing ran."
+  for i in "${!jobs[@]}"; do
+    keys[i]="$(key_at "$sha" "${jobs[$i]}")" || refuse "The ${jobs[$i]} key for ${sha:0:8} could not be computed, so nothing ran."
+  done
+  read_allowed
+
+  # Preflight: Docker, the images, the pins read inside the job image.
+  # Everything here needs no lock, so a refusal comes at once.
+  docker_check
+  for i in "${!jobs[@]}"; do
+    job="${jobs[$i]}"
+    if [ "$job" = "$kit_job" ]; then
+      [ -n "$kit_image" ] || { image_line "$job"; kit_image="$got"; }
+      images[i]="$kit_image"
+    else
+      [ -n "$job_image" ] || { image_line ""; job_image="$got"; }
+      images[i]="$job_image"
+      [ -z "$(m_job pin "$job")" ] || pinned+=("$job")
+    fi
+  done
+
+  if [ "${#pinned[@]}" -gt 0 ]; then
+    rc=0
+    answers="$("$BASH" "$launcher" versions --commit "$sha" "${pinned[@]}" < /dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || refuse "The job image did not answer its tool versions, so ${jobs[*]} did not run."
+    while read -r tool got; do
+      [ -n "$tool" ] || continue
+      answer_tools+=("$tool")
+      answer_versions+=("${got:-}")
+    done <<< "$answers"
+    for job in "${pinned[@]}"; do
+      for tool in $(m_job pin "$job"); do
+        pin="$(pin_at "$tool")"
+        [ -n "$pin" ] || refuse "${sha:0:8} pins no ${tool}, so ${job} did not run."
+        got="$(answer_of "$tool")"
+        [ "${got#v}" = "${pin#v}" ] || refuse "${tool} ${got:-(no version)} is not the pinned ${pin} in the job image, so ${job} did not run."
+      done
+    done
+  fi
+
+  # The facts' platforms: the container's, read inside the image, and this
+  # machine's, audit only.
+  out="$(docker run --rm --network none "${images[0]}" uname -s -m 2> /dev/null)" || out=""
+  read -r os arch <<< "$out" || true
+  [ -n "${os:-}" ] && [ -n "${arch:-}" ] || refuse "The job image did not say its platform, so ${jobs[*]} did not run."
+  container_platform="$(platform_of "$os" "$arch")"
+  case "$container_platform" in
+    linux/*) ;;
+    *) refuse "The job image runs on ${container_platform}, not Linux, so ${jobs[*]} did not run." ;;
+  esac
+  host_platform="$(platform_of "$(uname -s)" "$(uname -m)")"
+  docker_version="$(docker version --format '{{.Server.Version}}' 2> /dev/null)" || docker_version=""
+  [ -n "$docker_version" ] || docker_version=unknown
+
+  lock_take
+
+  for i in "${!jobs[@]}"; do
+    job="${jobs[$i]}"
+    key="${keys[$i]}"
+    log="${base}/logs/${job}-${key}.log"
+    entry="${base}/passed/${job}/${key}"
+    say "==> ${job} at ${sha:0:8} (key ${key:0:12}) in the job image, log ${log}"
+    started="$(iso_now)"
+    t0="$(date +%s)"
+    rc=0
+    "$BASH" "$launcher" run --run-id "$$" --commit "$sha" "$job" > "$log" 2>&1 < /dev/null || rc=$?
+    secs=$(($(date +%s) - t0))
+    if [ "$rc" -eq 0 ] && facts "$job" "$key" "$log" "$started" "$secs" "${images[$i]}" > "${entry}.tmp-$$"; then
+      mkdir -p "${base}/passed/${job}"
+      mv "${entry}.tmp-$$" "$entry"
+      say "${job} passed in ${secs}s. The passing entry is ${entry}."
+      passed+=("$job")
+    else
+      rm -f -- "${entry}.tmp-$$"
+      if [ "$rc" -ne 0 ]; then
+        say "--- the last 40 lines of ${log}"
+        tail -n 40 "$log"
+        say "${job} failed after ${secs}s (exit ${rc}). The log is ${log}."
+      fi
+      failed+=("$job")
+    fi
+  done
+  if [ "${#failed[@]}" -ne 0 ]; then
+    say "Failed: ${failed[*]}. Passed: ${passed[*]-none}."
+    return 1
+  fi
+  say "Passed: ${passed[*]}."
+}
+
+# The passing-entry directories exist before a run writes into them.
+for job in "${jobs[@]}"; do mkdir -p "${base}/passed/${job}"; done
+
+case "$cmd" in
+  run) cmd_run ;;
+  sign) cmd_sign ;;
+  push) cmd_push ;;
+esac

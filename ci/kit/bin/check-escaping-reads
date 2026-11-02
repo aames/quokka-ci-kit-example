@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""THE ESCAPING-READ FENCE (DESIGN.md 5.1; kit/README.md §2.2, §3.4, §3.1).
+
+Green by content is sound only if a job's key covers everything its tests read.
+A test that reads outside its job's key is a defect of the key, never an
+accepted blind spot. This fence finds every test file that builds a path out of
+its own tree and requires it to be declared by an `escaping-read` line of the
+manifest, and every declared outside path to be covered by that job's key.
+
+Rewritten from the reference implementation's fence: its
+scanners are lifted whole; the trees, the scan roots and the declarations are
+the manifest's `escaping-tree`, `escaping-scan` and `escaping-read` lines, and
+the keys its `paths` lines, all read through the library's one parser
+(`ci/kit/bin/keys dump HEAD`, kit/README.md §3.1).
+
+WHAT IS SCANNED. Each `escaping-scan <kind> <path>` line names a root: kind
+`go` reads every *_test.go under it; kind `ts` reads every *.test.ts and
+*.test.tsx under it and every .ts or .tsx file under its own test/ directory;
+node_modules, dist and coverage directories are skipped. A scanned file's TREE
+is the longest `escaping-tree` path holding it, and its JOB that line's job.
+
+WHAT COUNTS AS BUILDING A PATH OUT OF ITS OWN TREE. A file escapes when, in its
+code:
+
+  - a path call (filepath.Join, path.Join, resolve, join) climbs more `..`
+    segments than the file sits below its tree. The climb starts at the file's
+    own directory, except a TypeScript call whose first argument is
+    process.cwd() or projectRoot, which starts at the tree (the test runner's
+    cwd). A segment counts whether it is written as a literal or as a NAME
+    bound in the same file to a literal that climbs (`up := ".."`,
+    `const up = '..'`, `var up = "../.."`): each use of the name inside the
+    call adds that literal's climb. A name bound more than once counts at its
+    largest;
+  - a string literal outside any path call climbs likewise, from the file's
+    own directory, except a TypeScript literal handed straight to an fs call,
+    which resolves against the cwd and so starts at the tree; import
+    specifiers are modules, not paths read, and are skipped;
+  - it names a repository-root helper or binding (repoRoot, REPO_ROOT and the
+    like).
+
+It reads CODE, NOT PROSE: comments are blanked before the scan and string
+literals stay in scope, so the same text in a comment neither trips nor
+satisfies it.
+
+WHAT IT DOES NOT SEE, named so nobody takes a green for more than it is: a
+climb computed rather than written, such as a chain of filepath.Dir (or
+path.dirname) calls, strings.Repeat("../", n) or "..".repeat(n), a name bound
+to a path call's result or to another name, a name imported from another
+file, and a Go multiple assignment (`a, b := "..", "x"`). And ANY LANGUAGE BUT
+GO AND TYPESCRIPT (kit/README.md §3.4, `escaping-scan`): a test in another language that reads outside its
+tree is declared by hand as an `escaping-read` line, and the fence holds that
+declaration to the key but cannot find an undeclared one. Each run says so.
+
+Usage: check-escaping-reads [--root DIR] [--manifest-file FILE]
+The manifest is DIR's ci/manifest at HEAD, or FILE (a working-tree file, read
+by the same parser). Exit 0 when every escaping file is declared and keyed; 1
+otherwise; 2 when the fence cannot run.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LIB = os.path.join(HERE, "..", "lib", "keys.sh")
+KEYS = os.path.join(HERE, "keys")
+SCAN_KINDS = ("go", "ts")
+D12 = ("This fence scans Go and TypeScript only (kit/README.md §3.4): a test in any other language that reads "
+       "outside its tree is declared by hand as an escaping-read line of ci/manifest, and the fence holds that "
+       "declaration to the key but cannot find an undeclared one.")
+
+PATH_CALL = re.compile(
+    r"(?<![\w.])(?:filepath\.Join|path\.Join|path\.join|path\.resolve|resolve|join)\s*\("
+)
+ROOT_NAME = re.compile(r"\brepo_?root\w*", re.IGNORECASE)
+CWD_BASE = re.compile(r"^\s*(?:process\.cwd\(\)|(?:projectRoot|PROJECT_ROOT)\b)")
+IMPORT_CONTEXT = re.compile(
+    r"(?:\bfrom|\bimport|\bmock|\bimportActual|\brequire|\bdoMock)\s*\(?\s*$"
+)
+FS_CALL_CONTEXT = re.compile(
+    r"\b(?:readFileSync|readFile|readdirSync|readdir|existsSync|statSync|stat|opendirSync)\s*\(\s*$"
+)
+REGEX_PRECEDERS = set("(,=:[!&|?{};+-*%<>~^")
+
+
+def strip_comments(src, lang):
+    """Blank every comment, keeping offsets and newlines; keep literals.
+
+    Returns (stripped source, list of (start, end, content) string literals).
+    """
+    out = list(src)
+    literals = []
+    n = len(src)
+    i = 0
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    def prev_significant(pos):
+        k = pos - 1
+        while k >= 0 and src[k] in " \t\r\n":
+            k -= 1
+        if k < 0:
+            return ""
+        m = re.search(r"(\w+)$", src[max(0, k - 10) : k + 1])
+        if m and m.group(1) in ("return", "typeof", "case", "in", "of"):
+            return "("
+        return src[k]
+
+    while i < n:
+        two = src[i : i + 2]
+        if two == "//":
+            end = src.find("\n", i)
+            end = n if end == -1 else end
+            blank(i, end)
+            i = end
+            continue
+        if two == "/*":
+            end = src.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+            blank(i, end)
+            i = end
+            continue
+        ch = src[i]
+        if lang == "go" and ch == "`":
+            end = src.find("`", i + 1)
+            end = n if end == -1 else end
+            literals.append((i, end + 1, src[i + 1 : end]))
+            i = end + 1
+            continue
+        if ch in ("'", '"') or (lang == "ts" and ch == "`"):
+            j = i + 1
+            while j < n and src[j] != ch:
+                if src[j] == "\\":
+                    j += 1
+                elif src[j] == "\n" and ch != "`":
+                    break
+                j += 1
+            literals.append((i, j + 1, src[i + 1 : j]))
+            i = j + 1
+            continue
+        if lang == "ts" and ch == "/":
+            before = prev_significant(i)
+            if before == "" or before in REGEX_PRECEDERS:
+                j = i + 1
+                in_class = False
+                while j < n and src[j] != "\n":
+                    if src[j] == "\\":
+                        j += 2
+                        continue
+                    if src[j] == "[":
+                        in_class = True
+                    elif src[j] == "]":
+                        in_class = False
+                    elif src[j] == "/" and not in_class:
+                        break
+                    j += 1
+                i = j + 1
+                continue
+        i += 1
+    return "".join(out), literals
+
+
+def climb(text):
+    """The number of `..` segments in one literal's content."""
+    return sum(1 for seg in re.split(r"[/\\]", text) if seg == "..")
+
+
+# A name bound to a string literal: `up := ".."`, `var up = ".."`,
+# `const up = '..'`, `let up: string = '..'`, `up = ".."`. Matched against the
+# code before the literal on its own line; `==`, `!=`, `<=` and `>=` cannot end
+# the match because the character before the `=` would have to be a name.
+BINDING = re.compile(r"(?<![\w.$])([A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?:?=\s*$")
+NAME = re.compile(r"(?<![\w.$])([A-Za-z_$][\w$]*)\b(?!\s*\()")
+
+
+def climbing_names(code, literals):
+    """Every name bound in this file to a literal that climbs, with its climb."""
+    names = {}
+    for start, end, content in literals:
+        up = climb(content)
+        if up == 0:
+            continue
+        line_start = code.rfind("\n", 0, start) + 1
+        m = BINDING.search(code[line_start:start])
+        if not m:
+            continue
+        rest = code[end:].lstrip(" \t")
+        if rest and rest[0] not in "\n;,)":
+            continue
+        names[m.group(1)] = max(up, names.get(m.group(1), 0))
+    return names
+
+
+def masked(code, literals):
+    """The code with every literal's content blanked, so a name is never read out of a string."""
+    out = list(code)
+    for start, end, _content in literals:
+        for k in range(start, min(end, len(out))):
+            if out[k] != "\n":
+                out[k] = " "
+    return "".join(out)
+
+
+def call_span(code, open_paren):
+    """The index just past the parenthesis matching the one at open_paren."""
+    depth = 0
+    for k in range(open_paren, len(code)):
+        c = code[k]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return len(code)
+
+
+def escapes(rel, src, lang, tree):
+    """Every reason, with its line, that this file builds a path out of its tree."""
+    code, literals = strip_comments(src, lang)
+    # Literal contents stay in scope for the helper-name rule, but a comment
+    # cannot reach it: `code` has every comment blanked.
+    depth = len(os.path.dirname(rel[len(tree) + 1 :]).split("/"))
+    reasons = []
+
+    def line_of(pos):
+        return code.count("\n", 0, pos) + 1
+
+    names = climbing_names(code, literals)
+    bare = masked(code, literals) if names else code
+    spans = []
+    for m in PATH_CALL.finditer(code):
+        start = m.end() - 1
+        end = call_span(code, start)
+        spans.append((start, end))
+        inside = [lit for lit in literals if start < lit[0] < end]
+        total = sum(climb(lit[2]) for lit in inside)
+        total += sum(names.get(n.group(1), 0) for n in NAME.finditer(bare, start + 1, end - 1))
+        base = depth
+        if lang == "ts" and CWD_BASE.match(code[start + 1 : end]):
+            base = 0
+        if total > base:
+            reasons.append(
+                f"{rel}:{line_of(m.start())}: a path call climbs {total} `..` from {base} below {tree}/"
+            )
+
+    for start, end, content in literals:
+        if any(a < start < b for a, b in spans):
+            continue
+        up = climb(content)
+        if up == 0:
+            continue
+        base = depth
+        if lang == "ts":
+            preceding = code[max(0, start - 40) : start]
+            if IMPORT_CONTEXT.search(preceding):
+                continue
+            if FS_CALL_CONTEXT.search(preceding):
+                base = 0
+        if up > base:
+            reasons.append(
+                f"{rel}:{line_of(start)}: the literal {content!r} climbs out of {tree}/"
+            )
+
+    for m in ROOT_NAME.finditer(code):
+        reasons.append(f"{rel}:{line_of(m.start())}: names a repository-root helper ({m.group(0)})")
+        break
+    return reasons
+
+
+def test_files(root, scans, trees):
+    """(rel, lang, tree, job) for every test file under each scan root; a file
+    no escaping-tree holds is returned with tree None."""
+    found = []
+    for lang, top in scans:
+        base = os.path.join(root, top)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in ("node_modules", "dist", "coverage")]
+            for name in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/")
+                if lang == "go":
+                    hit = name.endswith("_test.go")
+                else:
+                    hit = name.endswith((".ts", ".tsx")) and (
+                        re.search(r"\.test\.tsx?$", name) is not None or rel.startswith(top.rstrip("/") + "/test/")
+                    )
+                if not hit:
+                    continue
+                tree, job = owner(rel, trees)
+                found.append((rel, lang, tree, job))
+    return sorted(set(found))
+
+
+def owner(rel, trees):
+    """The longest escaping-tree path holding rel, and its job."""
+    best = (None, None)
+    for job, paths in trees.items():
+        for t in paths:
+            if (t == "." or rel.startswith(t + "/")) and (best[0] is None or len(t) > len(best[0])):
+                best = (t, job)
+    return best
+
+
+def read_dump(root, manifest_file):
+    if manifest_file:
+        script = (
+            '. "$1" || exit 2; kit__manifest_load_text "$2" "$(< "$3")" || exit 2; t=$(printf "\\t"); '
+            'for r in "${KIT__REC[@]}"; do printf "%s\\n" "${r#*"$t"}"; done'
+        )
+        run = subprocess.run(["bash", "-c", script, "fence", LIB, manifest_file, manifest_file],
+                             capture_output=True, text=True)
+        what = manifest_file
+    else:
+        run = subprocess.run(["bash", KEYS, "dump", "HEAD"], cwd=root, env=dict(os.environ, KIT_KEYS_REPO=root),
+                             capture_output=True, text=True)
+        what = "ci/manifest at HEAD"
+    if run.returncode != 0:
+        print(f"the escaping-read fence could not read {what}: {run.stderr.strip()}")
+        sys.exit(2)
+    classes, keys, trees, scans, entries = {}, {}, {}, [], []
+    for line in run.stdout.splitlines():
+        f = line.split("\t")
+        d, words = f[0], f[1:]
+        if d == "job":
+            classes[words[0]] = words[1]
+        elif d == "paths":
+            keys.setdefault(words[0], []).extend(words[1:])
+        elif d == "escaping-tree":
+            trees.setdefault(words[0], []).extend(words[1:])
+        elif d == "escaping-scan":
+            scans.append((words[0], words[1]))
+        elif d == "escaping-read":
+            entries.append(words[0])
+    manifest = {}
+    for entry in entries:
+        fields = entry.split("|")
+        if len(fields) != 4:
+            print(f"the escaping-read fence cannot parse the escaping-read entry: {entry}")
+            sys.exit(2)
+        job, path, reads, _why = fields
+        manifest[path] = (job, reads.split())
+    return classes, keys, trees, scans, manifest
+
+
+def covered(path, key_paths):
+    return any(k == "." or path == k or path.startswith(k + "/") for k in key_paths)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="the kit's escaping-read fence")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--manifest-file", default=None)
+    args = parser.parse_args()
+    root = os.path.abspath(args.root)
+    classes, keys, trees, scans, manifest = read_dump(root, os.path.abspath(args.manifest_file) if args.manifest_file else None)
+
+    print(D12)
+    for kind, _top in scans:
+        if kind not in SCAN_KINDS:
+            print(f"the escaping-read fence has no scanner for {kind}, so it cannot run.")
+            return 2
+    scanned = {t for _k, t in scans}
+    for job, paths in sorted(trees.items()):
+        for t in paths:
+            if not any(t == s or s.startswith(t + "/") or t.startswith(s + "/") for s in scanned):
+                print(f"{job + (chr(39) if job.endswith('s') else chr(39) + 's')} tree {t} has no escaping-scan line, so its reads are declared by hand (kit/README.md §3.4).")
+    files = test_files(root, scans, trees)
+    if not files:
+        print("the escaping-read fence found no test files, so it would prove nothing.")
+        return 2
+
+    failures = []
+    escaping = 0
+    for rel, lang, tree, job in files:
+        if tree is None:
+            failures.append(f"{rel} is scanned but sits in no escaping-tree, so the fence cannot say which job's key must cover its reads.")
+            continue
+        with open(os.path.join(root, rel), encoding="utf-8") as fh:
+            src = fh.read()
+        reasons = escapes(rel, src, lang, tree)
+        if not reasons:
+            continue
+        escaping += 1
+        if rel not in manifest:
+            failures.append(f"{rel} builds a path out of {tree}/ and is not declared by an escaping-read line of ci/manifest:")
+            failures.extend(f"    {r}" for r in reasons)
+
+    for rel, (job, reads) in sorted(manifest.items()):
+        if not os.path.isfile(os.path.join(root, rel)):
+            failures.append(f"{rel} is declared by an escaping-read line but does not exist; remove the line.")
+            continue
+        if classes.get(job) not in ("local", "ci-only"):
+            failures.append(f"{rel} is declared for {job}, which is not a local or ci-only job.")
+            continue
+        if not any(rel.startswith(t + "/") for t in trees.get(job, [])):
+            where = " or ".join(t + "/" for t in trees.get(job, [])) or "no escaping-tree"
+            failures.append(f"{rel} is declared for job {job} but is not in {where}.")
+        if reads in (["WHOLE-TREE"], ["NONE"]):
+            continue
+        if not reads:
+            failures.append(f"{rel} declares no outside path; use NONE when it reads nothing.")
+        for path in reads:
+            if not covered(path, keys.get(job, [])):
+                failures.append(f"{rel} reads {path}, which the {job} key does not cover; add it to the paths {job} line.")
+
+    if failures:
+        print("\n".join(failures))
+        print("The escaping-read fence FAILED: a test that reads outside its job's key is a defect of the key. "
+              "Declare the read by an escaping-read line and put the path in that job's paths line, or move the check "
+              "into the always-on job.")
+        return 1
+    print(f"OK: {len(files)} test files scanned, {escaping} build a path out of their tree, every one declared and keyed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

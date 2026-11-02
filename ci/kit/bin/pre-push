@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+#
+# THE PRE-PUSH HOOK (DESIGN.md 6.8; kit/README.md §2.2, §2.4).
+# Derived from the author's private reference implementation. The
+# adopter's .githooks/pre-push is the three-line shim
+# ci/kit/hooks/pre-push.shim, which runs this file from the working copy;
+# active once per clone after `git config core.hooksPath .githooks`.
+#
+#   1. It reads git's `<local ref> <local sha> <remote ref> <remote sha>` lines
+#      and acts only on refs/heads/* updates that are not deletions. A push of
+#      refs/ci/*, a tag or a deletion exits 0 untouched, which with
+#      --no-verify is also why its own record pushes do not recurse.
+#   2. The jobs are the `local` jobs of the working copy's ci/manifest, the
+#      kit job included; a ci-only job is never keyed. A pushed sha with no
+#      ci/kit/lib/keys.sh predates the kit: one sentence, and it passes. For
+#      every other pushed sha it computes each job's key with THAT commit's
+#      library and drops every key that already has refs/ci/local/<job>/<key>
+#      or a CI green record on the remote (one ls-remote naming every
+#      candidate ref and refs/heads/<main-branch>). A sha whose ancestry lacks
+#      the remote's main tip is named once on stderr with the merge rule's
+#      sentence; a warning, never a refusal.
+#   3. A remaining key with a passing entry in the cache
+#      (<common dir>/<project>-ci/passed/<job>/<key>) is signed from it; the
+#      rest run through the sibling local-ci run, its status read directly.
+#      The jobs run in the job image, so the check needs Docker and nothing
+#      else on this machine.
+#   4. Non-zero refuses the push (exit 1), one sentence per failed job naming
+#      its log. Nothing is signed.
+#   5. Zero: local-ci sign, then push, for each key; then exit 0 and the
+#      branch goes. `sign` refuses a key with no passing entry, so a record is
+#      reachable only after the job's verdict exited 0.
+#
+# THE LISTS. The working copy's ci/manifest is read once, by the sibling
+# library's one parser in a child under "$BASH", into indexed arrays: the job
+# names, the project and the main branch. The keys are one indexed list,
+# sha by sha and job by job (keys[s * <jobs> + j]).
+#
+# BASH 3.2: this runs under the macOS /bin/bash, the one a git client
+# reaches. No declare -A, mapfile, readarray, case-changing expansions,
+# [[ -v ]], wait -n, negative subscripts or coproc; its external commands are
+# inside the host allow-list and no host tool parses any output (bash's own
+# read, case and [[ =~ ]] do). Every child it starts, the driver and the key
+# computation alike, runs under "$BASH".
+#
+# --no-verify skips this hook; the branch then arrives with no record and its
+# pull request runs the jobs in CI. This hook never writes a refs/ci/green/
+# ref.
+set -euo pipefail
+
+readonly ZERO='0000000000000000000000000000000000000000'
+readonly RE_KEY='^[0-9a-f]{64}$'
+remote="${1:-origin}"
+tab=$'\t'
+
+common="$(git rev-parse --path-format=absolute --git-common-dir)"
+top="$(git rev-parse --show-toplevel)"
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+local_ci="${here}/local-ci"
+
+# Item 1: the branch updates that are not deletions.
+shas=()
+while read -r _lref lsha rref _rsha; do
+  case "$rref" in refs/heads/*) ;; *) continue ;; esac
+  [ "$lsha" != "$ZERO" ] || continue
+  case " ${shas[*]-} " in *" ${lsha} "*) ;; *) shas+=("$lsha") ;; esac
+done
+[ "${#shas[@]}" -gt 0 ] || exit 0
+
+# Item 2, the lists: the working copy's ci/manifest, read once.
+recs=""
+if [ -f "${top}/ci/manifest" ]; then
+  # shellcheck disable=SC2016
+  recs="$("$BASH" -c '. "$1"; kit__manifest_records ci/manifest < "$2"' _ "${here}/../lib/keys.sh" "${top}/ci/manifest")" || {
+    echo "The working copy's ci/manifest could not be read, so nothing was pushed. Fix what it names, or push with --no-verify and the pull request will run the jobs." >&2
+    exit 1
+  }
+fi
+test_jobs=() project="" main=""
+while IFS= read -r rec; do
+  [ -n "$rec" ] || continue
+  rec="${rec#*"$tab"}"
+  case "$rec" in
+    "job$tab"*"${tab}local") rec="${rec#job"$tab"}"; test_jobs+=("${rec%%"$tab"*}") ;;
+    "project$tab"*) project="${rec#project"$tab"}" ;;
+    "main-branch$tab"*) main="${rec#main-branch"$tab"}" ;;
+  esac
+done <<< "$recs"
+if [ -z "$project" ] || [ -z "$main" ] || [ "${#test_jobs[@]}" -eq 0 ]; then
+  echo "The working copy has no ci/manifest naming its local jobs, so no local record was made and the pull request will run the jobs."
+  exit 0
+fi
+state="${common}/${project}-ci"
+
+# Each sha that predates the kit passes with its sentence; the rest are kept.
+kept=()
+for sha in "${shas[@]}"; do
+  if git cat-file -e "${sha}:ci/kit/lib/keys.sh" 2> /dev/null; then
+    kept+=("$sha")
+  else
+    echo "${sha:0:8} predates the kit, so no local record was made and the pull request will run its jobs."
+  fi
+done
+[ "${#kept[@]}" -gt 0 ] || exit 0
+shas=("${kept[@]}")
+
+# key_at <commit> <job>: the job's key by that commit's own library, in a
+# child shell under "$BASH".
+key_at() {
+  local file rc=0 out
+  file="$(mktemp "${TMPDIR:-/tmp}/${project}-ci-keys.XXXXXX")"
+  git show "$1:ci/kit/lib/keys.sh" > "$file" 2> /dev/null || { rm -f -- "$file"; return 1; }
+  # SC2016: the program is in single quotes; its $1 to $3 belong to the child.
+  # shellcheck disable=SC2016
+  out="$("$BASH" -c '. "$1"; kit_key "$2" "$3"' _ "$file" "$1" "$2")" || rc=$?
+  rm -f -- "$file"
+  [ "$rc" -eq 0 ] && [[ "$out" =~ $RE_KEY ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# The keys, one list in the order sha by sha, job by job: the key of sha s and
+# the job at position j of test_jobs is keys[s * <jobs> + j]. key_of <s> <job>
+# reads it back.
+keys=()
+key_of() {
+  local j
+  for j in "${!test_jobs[@]}"; do
+    if [ "${test_jobs[$j]}" = "$2" ]; then printf '%s\n' "${keys[$(($1 * ${#test_jobs[@]} + j))]}"; return 0; fi
+  done
+  return 1
+}
+
+# Item 2: every candidate ref, then one ls-remote, which also reads the
+# remote's main for the merge rule's warning below.
+want=("refs/heads/${main}")
+for s in "${!shas[@]}"; do
+  sha="${shas[$s]}"
+  for job in "${test_jobs[@]}"; do
+    if ! k="$(key_at "$sha" "$job")"; then
+      echo "The ${job} key for ${sha:0:8} could not be computed, so nothing was pushed. Push with --no-verify and the pull request will run it." >&2
+      exit 1
+    fi
+    keys+=("$k")
+    want+=("refs/ci/local/${job}/${k}" "refs/ci/green/${job}/${k}")
+  done
+done
+rc=0
+listing="$(git ls-remote "$remote" "${want[@]}")" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "The records on ${remote} could not be read, so nothing was pushed. Check the connection and push again, or push with --no-verify and the pull request will run the jobs." >&2
+  exit 1
+fi
+# remote_sha <ref>: the object the listing names for that ref, or nothing.
+remote_sha() {
+  local osha oref
+  while read -r osha oref; do
+    if [ "$oref" = "$1" ]; then printf '%s\n' "$osha"; return 0; fi
+  done <<< "$listing"
+  return 0
+}
+on_remote() { [ -n "$(remote_sha "$1")" ]; }
+
+# The merge rule: a pushed sha whose ancestry lacks the remote's main tip (a
+# tip this clone never fetched included) is named once on stderr. A warning,
+# never a refusal. A remote with no main prints nothing.
+main_tip="$(remote_sha "refs/heads/${main}")"
+if [ -n "$main_tip" ]; then
+  for sha in "${shas[@]}"; do
+    if ! git merge-base --is-ancestor "$main_tip" "$sha" 2> /dev/null; then
+      echo "${sha:0:8} is behind ${main} (${main_tip:0:8}), so the merge may run tests again in CI. Merge origin/${main} into this branch before its last push." >&2
+    fi
+  done
+fi
+
+# Item 3: what each sha still needs, and what must run, by the sha's position.
+sign_jobs=()
+run_jobs=()
+for s in "${!shas[@]}"; do
+  sign_jobs[s]=""
+  run_jobs[s]=""
+  for job in "${test_jobs[@]}"; do
+    k="$(key_of "$s" "$job")"
+    if on_remote "refs/ci/local/${job}/${k}" || on_remote "refs/ci/green/${job}/${k}"; then
+      continue
+    fi
+    sign_jobs[s]="${sign_jobs[$s]} ${job}"
+    [ -f "${state}/passed/${job}/${k}" ] || run_jobs[s]="${run_jobs[$s]} ${job}"
+  done
+done
+
+for s in "${!shas[@]}"; do
+  sha="${shas[$s]}"
+  [ -n "${run_jobs[$s]}" ] || continue
+  read -r -a jobs <<< "${run_jobs[$s]}"
+  echo "Running ${jobs[*]} on ${sha:0:8} before the push."
+  rc=0
+  "$BASH" "$local_ci" run --commit "$sha" "${jobs[@]}" < /dev/null || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    # Item 4, the environment: local-ci has said why in one sentence.
+    echo "Nothing was pushed. The check needs Docker and nothing else here; fix what it names and push again, or push with --no-verify and the pull request will run the jobs." >&2
+    exit 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    for job in "${jobs[@]}"; do
+      k="$(key_of "$s" "$job")"
+      [ -f "${state}/passed/${job}/${k}" ] \
+        || echo "${job} failed on ${sha:0:8}, so nothing was pushed. The log is ${state}/logs/${job}-${k}.log." >&2
+    done
+    exit 1
+  fi
+done
+
+# Item 5: every run passed; sign, then push, each record before the branch.
+for s in "${!shas[@]}"; do
+  sha="${shas[$s]}"
+  [ -n "${sign_jobs[$s]}" ] || continue
+  read -r -a jobs <<< "${sign_jobs[$s]}"
+  rc=0
+  "$BASH" "$local_ci" sign --commit "$sha" "${jobs[@]}" < /dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "The records for ${sha:0:8} could not be signed, so nothing was pushed." >&2
+    exit 1
+  fi
+  rc=0
+  "$BASH" "$local_ci" push --remote "$remote" --commit "$sha" "${jobs[@]}" < /dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "The records for ${sha:0:8} could not be pushed, so the branch was not pushed." >&2
+    exit 1
+  fi
+done
+exit 0

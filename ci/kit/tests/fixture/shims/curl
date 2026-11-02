@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# THE curl SHIM for K-record: answers the record writer's POST with the next
+# code of $CURL_CODES (space separated; 000 is a refused connection), the
+# body of the same position of $CURL_BODIES (| separated). Logs each call.
+PATH="$SYS_PATH"
+out="" fmt=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift 2 ;; -w) fmt="$2"; shift 2 ;; *) shift ;; esac
+done
+printf 'post\n' >> "$CURL_LOG"
+n="$(wc -l < "$CURL_LOG" | tr -d ' ')"
+# shellcheck disable=SC2086
+set -- $CURL_CODES; code="${!n:-${!#}}"
+IFS='|' read -r -a bodies <<< "${CURL_BODIES:-}"
+body="${bodies[$((n - 1))]:-${bodies[0]:-}}"
+[ "$code" != 000 ] || exit 7
+[ -z "$out" ] || printf '%s' "$body" > "$out"
+[ -z "$fmt" ] || printf '%s' "$code"

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# THE HOST'S PREREQUISITES (kit/README.md §2.2; DESIGN.md §6.0):
+# Docker answering, git 2.34 or later (SSH signing), OpenSSH's ssh-keygen with
+# -Y find-principals, and the system bash (3.2 or later). Nothing else is
+# asked of a workstation.
+#
+#   ci/kit/bin/check-prereqs
+#
+# One sentence per refusal, every check run; exit 2 on any refusal, 0 with
+# one line when all four hold.
+#
+# BASH 3.2: this runs under the macOS /bin/bash. Its external commands are
+# docker, git and ssh-keygen; their output is read by bash's own [[ =~ ]].
+set -uo pipefail
+
+refused=0
+refuse() { echo "check-prereqs: $1" >&2; refused=1; }
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 3 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 3 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 2 ]; }; then
+  refuse "bash ${BASH_VERSION:-unknown} is older than 3.2, the system bash the kit's host side is written for."
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  refuse "docker is not on PATH. Install Docker (Docker Desktop on a Mac) and start it."
+elif ! docker info >/dev/null 2>&1; then
+  refuse "Docker does not answer docker info. Start Docker (Docker Desktop on a Mac) and run this again."
+fi
+
+git_version="$(git --version 2>/dev/null)" || git_version=""
+if [[ "$git_version" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]]; then
+  major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}"
+  if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 34 ]; }; then
+    refuse "git ${major}.${minor} is older than 2.34, the first git that signs with SSH keys."
+  fi
+else
+  refuse "git does not answer git --version. Install git 2.34 or later."
+fi
+
+# ssh-keygen with no operation after -Y prints its usage; a build that knows
+# signing lists `-Y find-principals` in it.
+keygen_usage="$(ssh-keygen -Y 2>&1)"
+if ! [[ "$keygen_usage" =~ -Y\ find-principals ]]; then
+  refuse "ssh-keygen does not know -Y find-principals. Install OpenSSH 8.2 or later."
+fi
+
+if [ "$refused" -ne 0 ]; then
+  exit 2
+fi
+echo "check-prereqs: Docker answers, ${git_version}, ssh-keygen knows -Y find-principals, bash ${BASH_VERSION}."

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# THE KEYS OF A COMMIT, AND ITS MANIFEST AS DATA (kit/README.md §2.1, §3.1).
+#
+#   ci/kit/bin/keys <commit>          `<job> <key>` for every job line, in manifest order
+#   ci/kit/bin/keys <commit> <job>    one key; <job> may also be `image` or `base`
+#   ci/kit/bin/keys dump <commit>     the validated manifest, one line per directive,
+#                                     `<directive>\t<word>...`, free text last
+#
+# Every key and the dump are read from <commit>'s own ci/manifest, never the
+# working tree. Every reader not written in bash takes the dump, so the one
+# awk parser in kit/lib/keys.sh is the only definition of the format.
+#
+# EXIT: 0 printed; 1 <commit> is not a commit; 2 usage, or the commit's
+# manifest is absent, refused (the line and the rule on stderr) or names no
+# such key.
+#
+# BASH 3.2: this runs under the macOS /bin/bash when the hook calls it.
+set -euo pipefail
+
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+# shellcheck source-path=SCRIPTDIR source=../lib/keys.sh
+. "$here/../lib/keys.sh"
+
+usage() {
+  echo "usage: keys <commit> [<job>] | keys dump <commit>" >&2
+  exit 2
+}
+
+case "$#:${1:-}" in
+  2:dump) kit_manifest_dump "$2" ;;
+  1:*) kit_keys "$1" ;;
+  2:*) kit_key "$1" "$2" ;;
+  *) usage ;;
+esac

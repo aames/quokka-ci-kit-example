@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""THE gh SHIM (kit/README.md §6.1): `gh api repos/<r>/commits/<sha>/check-runs?check_name=<c>&filter=all&per_page=100 --jq <expr>`
+answered from the table $GH_TABLE, one `sha|check name|conclusion|app slug` row per check run. The jq
+expression is not run: its conditions (`.conclusion == "x"`, `.app.slug == "y"`) are read out of it and
+applied to the rows, and the expression must end `| length`, so a library that drops a condition gets
+more rows counted and a different answer. $GH_FAIL makes the call fail as an unreachable API does."""
+import os, re, sys
+
+log = os.environ.get("GH_LOG")
+if log:
+    with open(log, "a") as fh:
+        fh.write(" ".join(sys.argv[1:]) + "\n")
+if os.environ.get("GH_FAIL"):
+    sys.stderr.write("gh: HTTP 502\n")
+    sys.exit(1)
+args = sys.argv[1:]
+if len(args) < 2 or args[0] != "api":
+    sys.exit(64)
+url = args[1]
+expr = args[args.index("--jq") + 1] if "--jq" in args else "."
+m = re.search(r"/commits/([0-9a-f]+)/check-runs\?(.*)", url)
+if not m:
+    sys.exit(64)
+sha, query = m.group(1), dict(p.split("=", 1) for p in m.group(2).split("&"))
+if not expr.rstrip().endswith("| length"):
+    sys.stderr.write("gh shim: only a count is answered\n")
+    sys.exit(64)
+conds = re.findall(r'\.([a-z_.]+) == "([^"]*)"', expr)
+rows = []
+try:
+    with open(os.environ.get("GH_TABLE", "/dev/null")) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("|")
+            if len(parts) == 4 and parts[0] == sha and parts[1] == query.get("check_name"):
+                rows.append({"conclusion": parts[2], "app.slug": parts[3]})
+except OSError:
+    pass
+print(sum(1 for r in rows if all(r.get(k) == v for k, v in conds)))

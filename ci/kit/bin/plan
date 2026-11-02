@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+#
+# THE PLAN (DESIGN.md 5.3; kit/README.md §2.2, §2.1, §4.4, §5.5): the first
+# steps of the always-on job, deciding which of this run's jobs execute.
+#
+#   1. Read the commit's ci/manifest through the library (kit/lib/keys.sh) and
+#      compute every job's key.
+#   2. One `git ls-remote` naming the exact record refs: refs/ci/green/<job>/
+#      <key> for every job, and refs/ci/local/<job>/<key> for every `local`
+#      and `ci-only` job; then the trust check of each hit.
+#   3. Emit one decision per job to $GITHUB_OUTPUT, each key, `main` and
+#      `ref_group`; then source the manifest's plan extension, if it names one.
+#   4. Write a summary table to $GITHUB_STEP_SUMMARY: job, key, record,
+#      provenance, decision. This is how a skip is SEEN.
+#
+# MODES, decided in this order, before any record is read:
+#   task:<name>  a dispatch whose task is neither `tests` nor `weekly`: every
+#                kit job is `off`; the plan extension decides its own jobs.
+#   weekly       the schedule (its event is read as task=weekly) or a dispatch
+#                with task=weekly: the always-on job is `off`; every other
+#                job is `run` or `green` by its CI green record alone, every
+#                local record ignored (the local arm's condition 6), and
+#                ref_group carries the prefix `weekly-` so a push to the main
+#                branch neither cancels the run's jobs nor is cancelled by them.
+#   force        CI_PLAN_FORCE=true: every kit job runs, no record is read.
+#   normal       every job is `run` or `green` by its records.
+#
+# LOCAL RECORDS (DESIGN.md 6.7). For a `local` job, a key with no trusted
+# green record may be vouched for by refs/ci/local/<job>/<key>, trusted only
+# by the library's local arm (the signature against the main branch's signers
+# file, the key recomputed, the facts' pins, counts and skips), never on a
+# force or weekly run. A `ci-only` job's local ref is looked up too, only so
+# the arm can refuse it in its own sentence; it never decides. A trusted local
+# record shows `local: <principal>` in the summary's provenance column.
+#
+# PROVENANCE (DESIGN.md 5.4). A record is trusted only when the key
+# recomputed from the commit it points at equals the key in its name (the
+# commit fetched at depth 1 first when absent), and that commit carries a
+# SUCCESSFUL check run of the job's check name (the job's name, or its
+# manifest `check-name`) from the github-actions app. An untrusted record is
+# ignored and the job runs; the summary says why.
+#
+# THE MAIN BRANCH IS DECIDED HERE, CASE-SENSITIVELY: `main=true` only when
+# GITHUB_REF is exactly refs/heads/<main-branch>, compared by the shell,
+# because GitHub's `==` ignores case.
+#
+# A PLAN THAT CANNOT READ THE RECORDS RUNS EVERYTHING and says so: skipping a
+# job on a record nobody could read would be a pass nobody earned.
+#
+# THE PLAN EXTENSION (kit/README.md §4.4). When the manifest names `plan-extension`, that
+# file is sourced after every kit decision, with KIT_MODE, KIT_MAIN,
+# KIT_REF_GROUP, KIT_SHA and the associative arrays KIT_KEY, KIT_DECISION,
+# KIT_NOTE, KIT_PROVENANCE in scope, and three functions: kit_decide <job>
+# <decision> <note> [<provenance>] for a job the manifest does not declare,
+# kit_output <name> <value>, and kit_summary_row <job> <key or -> <note>
+# <provenance> <decision>. The kit's decisions and keys are snapshot before
+# the source and compared after; any difference fails the plan, and the kit
+# jobs' outputs are written from the snapshot (kit/README.md §4.4: an accident
+# check for the adopter's reviewed code, never a boundary).
+#
+# THE TOKEN (kit/README.md §5.5). When GH_TOKEN is set, this script masks the basic
+# authorisation value it derives and hands it to git for this process alone
+# through git's environment configuration, so the ls-remote and the fetches
+# work on a private repository and the checkout keeps no credential.
+#
+# Inputs (environment):
+#   CI_PLAN_SHA      the commit under test (the pull request's head on a
+#                    pull_request run, github.sha otherwise)        required
+#   CI_PLAN_EVENT    github.event_name                               required
+#   CI_PLAN_FORCE    "true" ignores every record
+#   CI_PLAN_TASK     the dispatch input `task`
+#   CI_PLAN_REMOTE   the remote to read records from (default origin)
+#   CI_PLAN_REPO     owner/name for the check-runs API (github.repository)
+#   GH_TOKEN         a token with checks: read, for `gh api` and git
+#   GITHUB_REF       the ref under test, set by the runner (unset: not main)
+#   GITHUB_SERVER_URL  the server git's header is scoped to (default
+#                    https://github.com)
+#   GITHUB_OUTPUT, GITHUB_STEP_SUMMARY   where the decisions and table go
+#
+# EXIT: 0 planned; 1 the plan failed and said why; 2 usage or a bash below 4.2.
+#
+# RUNNER ONLY: bash 4.2 or later (associative arrays).
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] \
+    || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo "The plan needs bash 4.2 or later and this is bash ${BASH_VERSION:-unknown}, so nothing ran." >&2
+  exit 2
+fi
+set -euo pipefail
+
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+# shellcheck source-path=SCRIPTDIR source=../lib/keys.sh
+. "$here/../lib/keys.sh"
+
+: "${CI_PLAN_SHA:?CI_PLAN_SHA is the commit under test}"
+: "${CI_PLAN_EVENT:?CI_PLAN_EVENT is github.event_name}"
+CI_PLAN_FORCE="${CI_PLAN_FORCE:-false}"
+CI_PLAN_TASK="${CI_PLAN_TASK:-}"
+CI_PLAN_REMOTE="${CI_PLAN_REMOTE:-origin}"
+CI_PLAN_REPO="${CI_PLAN_REPO:-}"
+GITHUB_REF="${GITHUB_REF:-}"
+# THE SCHEDULE IS THE WEEKLY RUN: a scheduled run carries no dispatch input,
+# so its event is read as task=weekly here, before any record is read, and
+# everything below (the decisions, the local arm's condition 6, the summary,
+# ref_group's prefix) treats it exactly as a `task: weekly` dispatch.
+if [ "$CI_PLAN_EVENT" = schedule ]; then
+  CI_PLAN_TASK=weekly
+fi
+export CI_PLAN_FORCE CI_PLAN_TASK
+out="${GITHUB_OUTPUT:-/dev/stdout}"
+summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+
+fail() { echo "::error::$*"; exit 1; }
+
+if [ -n "${GH_TOKEN:-}" ]; then
+  auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+  echo "::add-mask::${auth}"
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL:-https://github.com}/.extraheader"
+  export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+  unset auth
+fi
+
+kit_manifest_load "$CI_PLAN_SHA" \
+  || fail "the ci/manifest of ${CI_PLAN_SHA:0:12} could not be read, so the plan decided nothing. Nothing was run."
+
+# The jobs, in manifest order, by class.
+jobs=("${KIT_JOBS[@]}")
+declare -A class
+for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
+  class[${KIT_JOBS[$i]}]="${KIT_JOB_CLASS[$i]}"
+done
+is_local_lookup() { [ "${class[$1]}" = local ] || [ "${class[$1]}" = ci-only ]; }
+
+# check_name <job>: the check run that vouches for <job>'s green record, its
+# manifest `check-name` when another job writes the record, else its name.
+check_name() {
+  local named
+  named="$(kit__job_words check-name "$1")"
+  printf '%s\n' "${named:-$1}"
+}
+
+declare -A key decision note provenance
+for job in "${jobs[@]}"; do
+  key[$job]="$(kit_key "$CI_PLAN_SHA" "$job")" \
+    || fail "the key of ${job} at ${CI_PLAN_SHA:0:12} could not be computed. Nothing was run."
+  provenance[$job]='-'
+done
+
+main=false
+if [ "$GITHUB_REF" = "refs/heads/${KIT_MAIN_BRANCH}" ]; then
+  main=true
+fi
+
+# THE REF'S CONCURRENCY-GROUP KEY (DESIGN.md 5.6): the ref lower-cased with
+# every character outside [a-z0-9._-] as '-', then '-' and the first 16 hex of
+# sha256 of the EXACT ref, so nothing is left for GitHub to fold by case.
+ref_group="$(printf '%s' "${GITHUB_REF:-none}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+ref_group="${ref_group}-$(printf '%s' "${GITHUB_REF:-}" | kit__sha256 | cut -c1-16)"
+
+mode=normal
+if [ "$CI_PLAN_EVENT" = workflow_dispatch ] && [ -n "$CI_PLAN_TASK" ] \
+    && [ "$CI_PLAN_TASK" != tests ] && [ "$CI_PLAN_TASK" != weekly ]; then
+  mode="task:${CI_PLAN_TASK}"
+elif [ "$CI_PLAN_TASK" = weekly ]; then
+  mode=weekly
+elif [ "$CI_PLAN_FORCE" = true ]; then
+  mode=force
+fi
+if [ "$mode" = weekly ]; then
+  ref_group="weekly-${ref_group}"
+fi
+
+# decide_by_records <job>...: one ls-remote naming each job's green ref and,
+# for a local or ci-only job, its local ref; the trust check of each hit; one
+# decision per job. A green record is tried first and, trusted, decides; a
+# local record decides only when no green one does, by the local arm.
+decide_by_records() {
+  local job ref lref hit lhit rc lrc listing sentence absent=() want_main=false refs=()
+  for job in "$@"; do
+    refs+=("refs/ci/green/${job}/${key[$job]}")
+    ! is_local_lookup "$job" || refs+=("refs/ci/local/${job}/${key[$job]}")
+  done
+  if ! listing="$(git ls-remote "$CI_PLAN_REMOTE" "${refs[@]}")"; then
+    echo "::warning::the plan could not read the CI records from ${CI_PLAN_REMOTE}, so every job runs."
+    for job in "$@"; do
+      decision[$job]=run
+      note[$job]='records unreadable: runs rather than skips'
+    done
+    return 0
+  fi
+  # The key is recomputed from the record's own commit, which a depth-1
+  # checkout does not hold: every absent hit is fetched at depth 1 by its
+  # record ref (a local ref brings its tag object and the tag's commit). A
+  # fetch that fails leaves the commit absent, and an absent commit is never
+  # trusted.
+  while read -r hit ref; do
+    [ -n "$hit" ] || continue
+    [[ "$ref" != refs/ci/local/* ]] || want_main=true
+    git cat-file -e "${hit}^{commit}" 2>/dev/null || absent+=("$ref")
+  done <<< "$listing"
+  if [ "${#absent[@]}" -gt 0 ]; then
+    git fetch -q --no-tags --depth=1 "$CI_PLAN_REMOTE" "${absent[@]}" 2>/dev/null \
+      || echo "::warning::the plan could not fetch ${#absent[@]} record commit(s); their jobs run."
+  fi
+  # A local record is checked against the main branch's signers file and its
+  # manifest's not-run-allowed legs, so the main branch's tip is fetched once,
+  # at depth 1, when a local record was found and may be trusted on this run.
+  if [ "$want_main" = true ] && [ "$mode" != weekly ]; then
+    git fetch -q --no-tags --depth=1 "$CI_PLAN_REMOTE" \
+      "+refs/heads/${KIT_MAIN_BRANCH}:refs/remotes/origin/${KIT_MAIN_BRANCH}" 2>/dev/null \
+      || echo "::warning::the plan could not fetch the tip of ${KIT_MAIN_BRANCH}, so no local record can be trusted on this run."
+  fi
+  for job in "$@"; do
+    ref="refs/ci/green/${job}/${key[$job]}"
+    hit="$(awk -v r="$ref" '$2 == r { print $1 }' <<< "$listing")"
+    rc=0
+    [ -z "$hit" ] || kit_record_trusted "$CI_PLAN_REPO" "$hit" "$job" "${key[$job]}" "$(check_name "$job")" || rc=$?
+    if [ -z "$hit" ]; then
+      decision[$job]=run
+      note[$job]='no record for this key'
+    elif [ "$rc" -eq 0 ]; then
+      decision[$job]=green
+      note[$job]="record at ${hit:0:12}, trusted"
+      provenance[$job]='ci'
+      continue
+    elif [ "$rc" -eq 2 ]; then
+      decision[$job]=run
+      note[$job]="record at ${hit:0:12} NOT TRUSTED: the key of ${hit:0:12} for '${job}' is not this key, or that commit could not be read"
+    else
+      decision[$job]=run
+      note[$job]="record at ${hit:0:12} NOT TRUSTED: no successful '$(check_name "$job")' check run from github-actions on that commit"
+    fi
+    is_local_lookup "$job" || continue
+    lref="refs/ci/local/${job}/${key[$job]}"
+    lhit="$(awk -v r="$lref" '$2 == r { print $1 }' <<< "$listing")"
+    [ -n "$lhit" ] || continue
+    lrc=0
+    kit_record_trusted "$CI_PLAN_REPO" "$lhit" "$job" "${key[$job]}" "$job" "$lref" || lrc=$?
+    if [ "$lrc" -eq 0 ]; then
+      decision[$job]=green
+      note[$job]="local record at ${lhit:0:12}, trusted"
+      provenance[$job]="local: ${KIT_LOCAL_PRINCIPAL}"
+    else
+      # The job runs, and one sentence says which condition failed.
+      sentence="${job}: the local record for ${key[$job]:0:8} ${KIT_LOCAL_REASON:-could not be checked}, so ${job} ran."
+      echo "$sentence"
+      if [ -z "$hit" ]; then note[$job]="$sentence"; else note[$job]="${note[$job]}; ${sentence}"; fi
+    fi
+  done
+}
+
+case "$mode" in
+  task:*)
+    for job in "${jobs[@]}"; do
+      decision[$job]=off
+      note[$job]="the dispatch task ${CI_PLAN_TASK} runs no kit job"
+    done
+    ;;
+  weekly)
+    # The weekly run is the independent check: the always-on job's own
+    # checks do not run, and every other job runs on this tip unless a CI
+    # green record vouches for its key; a local record is listed and ignored
+    # by its condition 6, saying so.
+    rest=()
+    for job in "${jobs[@]}"; do
+      if [ "${class[$job]}" = always-on ]; then
+        decision[$job]=off
+        note[$job]='not a weekly job'
+      else
+        rest+=("$job")
+      fi
+    done
+    [ "${#rest[@]}" -eq 0 ] || decide_by_records "${rest[@]}"
+    ;;
+  force)
+    for job in "${jobs[@]}"; do
+      decision[$job]=run
+      note[$job]='force: every record ignored'
+    done
+    ;;
+  normal)
+    decide_by_records "${jobs[@]}"
+    ;;
+esac
+
+# --- THE PLAN EXTENSION (kit/README.md §4.4) -----------------------------
+
+# KIT_KEY, KIT_MODE, KIT_MAIN, KIT_REF_GROUP and KIT_SHA are the extension's
+# inputs, read by the file sourced below (SC2034 cannot see that).
+# THE SNAPSHOT (kit/README.md §4.4): every kit job's decision, key, note and
+# provenance, taken before the source. It is an accident check for the
+# adopter's own reviewed code, never a boundary: after the source a changed
+# decision or key fails the plan, and every kit job's outputs and summary row
+# are written from the snapshot, never from arrays the extension could touch.
+declare -A KIT_KEY KIT_DECISION KIT_NOTE KIT_PROVENANCE kit_declared
+declare -A kit_snap_decision kit_snap_key kit_snap_note kit_snap_provenance
+# shellcheck disable=SC2034
+for job in "${jobs[@]}"; do
+  KIT_KEY[$job]="${key[$job]}"
+  KIT_DECISION[$job]="${decision[$job]}"
+  KIT_NOTE[$job]="${note[$job]}"
+  KIT_PROVENANCE[$job]="${provenance[$job]}"
+  kit_declared[$job]=1
+  kit_snap_decision[$job]="${decision[$job]}"
+  kit_snap_key[$job]="${key[$job]}"
+  kit_snap_note[$job]="${note[$job]}"
+  kit_snap_provenance[$job]="${provenance[$job]}"
+done
+# shellcheck disable=SC2034
+KIT_MODE="$mode" KIT_MAIN="$main" KIT_REF_GROUP="$ref_group" KIT_SHA="$CI_PLAN_SHA"
+ext_jobs=() ext_outputs=() ext_rows=()
+
+kit__ext_refuse() {
+  echo "::error::The plan extension changed the decision of $1, which is the kit's to make, so nothing ran."
+  exit 1
+}
+kit__ext_refuse_key() {
+  echo "::error::The plan extension changed the key of $1, which is the kit's to compute, so nothing ran."
+  exit 1
+}
+
+# kit_decide <job> <decision> <note> [<provenance>]: a decision for a job the
+# manifest does not declare; its output line and its summary row (key `-`)
+# follow. kit_summary_row adds any further row the extension wants shown.
+kit_decide() {
+  local job="${1:-}" d="${2:-}"
+  [ -z "${kit_declared[$job]+x}" ] || kit__ext_refuse "$job"
+  [[ "$job" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] \
+    || fail "the plan extension decided a job named '${job}', which is not a job name, so nothing ran."
+  [[ "$d" =~ ^[a-z]+$ ]] \
+    || fail "the plan extension decided '${d}' for ${job}, which is not a decision word, so nothing ran."
+  [[ " ${ext_jobs[*]} " == *" ${job} "* ]] || ext_jobs+=("$job")
+  KIT_DECISION[$job]="$d"
+  KIT_NOTE[$job]="${3:-}"
+  KIT_PROVENANCE[$job]="${4:--}"
+}
+
+# kit_output <name> <value>: one more step output. The kit's own names
+# (<job>, <job>_key, main, ref_group) are refused, and a value holding a
+# newline, which would write a second output, is refused.
+kit_output() {
+  local name="${1:-}" value="${2:-}" job
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+    || fail "the plan extension wrote an output named '${name}', which is not an output name, so nothing ran."
+  case "$value" in *$'\n'* | *$'\r'*) fail "the plan extension wrote a value for ${name} holding a line break, so nothing ran." ;; esac
+  for job in "${jobs[@]}"; do
+    if [ "$name" = "$job" ] || [ "$name" = "${job}_key" ]; then
+      fail "the plan extension wrote the output ${name}, which is the kit's, so nothing ran."
+    fi
+  done
+  case "$name" in main | ref_group) fail "the plan extension wrote the output ${name}, which is the kit's, so nothing ran." ;; esac
+  ext_outputs+=("${name}=${value}")
+}
+
+# kit_summary_row <job> <key or -> <note> <provenance> <decision>: one more
+# row of the summary table, after the kit's.
+kit_summary_row() {
+  ext_rows+=("$(printf '| %s | %s | %s | %s | **%s** |' "${1:-}" "${2:--}" "${3:-}" "${4:--}" "${5:-}")")
+}
+
+if [ -n "$KIT_PLAN_EXTENSION" ]; then
+  [ -f "$KIT_PLAN_EXTENSION" ] \
+    || fail "ci/manifest names ${KIT_PLAN_EXTENSION} as the plan extension, which is not in this tree, so nothing ran."
+  # shellcheck disable=SC1090
+  . "$KIT_PLAN_EXTENSION"
+  for job in "${jobs[@]}"; do
+    [ "${KIT_DECISION[$job]-}" = "${kit_snap_decision[$job]}" ] || kit__ext_refuse "$job"
+    [ "${KIT_KEY[$job]-}" = "${kit_snap_key[$job]}" ] && [ "${key[$job]-}" = "${kit_snap_key[$job]}" ] \
+      || kit__ext_refuse_key "$job"
+  done
+fi
+
+# --- THE OUTPUTS AND THE SUMMARY ------------------------------------------
+
+{
+  for job in "${jobs[@]}"; do
+    printf '%s=%s\n' "$job" "${kit_snap_decision[$job]}"
+  done
+  for job in ${ext_jobs[@]+"${ext_jobs[@]}"}; do
+    printf '%s=%s\n' "$job" "${KIT_DECISION[$job]}"
+  done
+  for job in "${jobs[@]}"; do
+    printf '%s_key=%s\n' "$job" "${kit_snap_key[$job]}"
+  done
+  printf 'main=%s\n' "$main"
+  printf 'ref_group=%s\n' "$ref_group"
+  for line in ${ext_outputs[@]+"${ext_outputs[@]}"}; do
+    printf '%s\n' "$line"
+  done
+} >> "$out"
+
+{
+  printf '### CI plan for %s (%s, main: %s)\n\n' "${CI_PLAN_SHA:0:12}" "$CI_PLAN_EVENT" "$main"
+  # Provenance: which record a skip rests on, `ci` (a check run vouched for
+  # it) or `local: <principal>` (main's signers file named the signer); `-`
+  # where nothing was skipped on a record.
+  printf '| Job | Key | Record | Provenance | Decision |\n|---|---|---|---|---|\n'
+  for job in "${jobs[@]}"; do
+    printf '| %s | %s%s%s | %s | %s | **%s** |\n' "$job" '`' "${kit_snap_key[$job]:0:16}" '`' "${kit_snap_note[$job]}" "${kit_snap_provenance[$job]}" "${kit_snap_decision[$job]}"
+  done
+  for job in ${ext_jobs[@]+"${ext_jobs[@]}"}; do
+    printf '| %s | - | %s | %s | **%s** |\n' "$job" "${KIT_NOTE[$job]}" "${KIT_PROVENANCE[$job]}" "${KIT_DECISION[$job]}"
+  done
+  for line in ${ext_rows[@]+"${ext_rows[@]}"}; do
+    printf '%s\n' "$line"
+  done
+  if [ "$mode" = weekly ]; then
+    printf '\nThe weekly run (the schedule or a task: weekly dispatch) ignores every local record: each job runs on this tip unless a CI green record vouches for its key.\n'
+  fi
+} >> "$summary"

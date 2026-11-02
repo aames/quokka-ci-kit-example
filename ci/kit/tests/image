@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# THE KIT'S PROOFS THAT NEED A DOCKER DAEMON (kit/README.md §6.1,
+# §6.2): the base image built from kit/image/base.Dockerfile (K-image), the
+# entry script's tree-in with a fixture archive and a fixture pack (K-enter),
+# and the kit job itself run through the launcher in that base.
+#
+#   bash kit/tests/image [--family image|enter|harden|kitjob]...
+#
+# It runs where a socket is held (the kit repository's `kitsrc` job, an
+# adopter's socket-holding job, a workstation with Docker running) and never
+# starts, stops or reconfigures Docker. Everything it builds is tagged
+# kitfix-ci-* and removed at the end (its layers stay in Docker's build cache;
+# pruning is the owner's). The first build compiles bash 3.2.57 and installs
+# the Debian packages, which takes several minutes; later runs reuse the cache.
+# Exit 0 all held; 1 a case failed; 2 Docker does not answer. On success it
+# ends with
+#   ${CIKIT_PROJECT}-ci-job v1 counts ${CIKIT_JOB} image_cases <n>
+# shellcheck disable=SC2154,SC2034,SC2016
+set -uo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+. "$here/lib.sh"
+
+want=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --family) want="$want $2"; shift 2 ;;
+    *) echo "usage: image [--family image|enter|harden|kitjob]..." >&2; exit 2 ;;
+  esac
+done
+[ -n "$want" ] || want="image enter harden kitjob"
+if ! command -v docker > /dev/null 2>&1 || ! docker info > /dev/null 2>&1; then
+  echo "tests/image: Docker does not answer docker info, so nothing ran." >&2
+  exit 2
+fi
+
+img_tags=""
+img_cleanup() { local t; for t in $img_tags; do docker image rm "$t" > /dev/null 2>&1 || true; done; }
+trap 'img_cleanup; kitt_cleanup' EXIT
+arch="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2> /dev/null || echo unknown)"
+echo "tests/image: Docker server platform $arch"
+
+# The real launcher, on the real Docker, on a fixture repository whose ci/kit
+# is the kit under test: it builds the base and tags it by the base key.
+ready() {
+  [ -n "${BASE_TAG:-}" ] && return 0
+  fx_new img
+  local line
+  if ! line="$(cd "$FX" && env -i HOME="$work" TMPDIR="$work" PATH="$KITT_SYS_PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null "$BASH" "$KITT_KIT/bin/container" image --commit HEAD kitself 2> "$work/build.err")"; then
+    tail -20 "$work/build.err"; bad "the base image did not build from kit/image/base.Dockerfile"; return 1
+  fi
+  BASE_TAG="${line%% *}"; img_tags="$img_tags $BASE_TAG"
+  ok "the base builds from kit/image/base.Dockerfile on $arch and is tagged $BASE_TAG"
+}
+in_img() { docker run --rm --network none "$BASE_TAG" "$@"; }
+
+fam_image() {
+  local out env_names
+  ready || return 0
+  eq "image (d): the image runs as uid 1001, not root" "1001 ci" "$(in_img bash -c 'echo "$(id -u) $(id -un)"')"
+  out="$(in_img /opt/bash-3.2/bin/bash --version | head -1)"
+  case "$out" in *"version 3.2.57"*) ok "image (e): /opt/bash-3.2/bin/bash is 3.2.57" ;; *) bad "bash 3.2: $out" ;; esac
+  env_names="$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$BASE_TAG" | sed 's/=.*//')"
+  if printf '%s\n' "$env_names" | grep -Eqi 'TOKEN|KEY|SECRET|PASSWORD'; then bad "image (f): an ENV names TOKEN, KEY, SECRET or PASSWORD"; else ok "image (f): no ENV in the image names TOKEN, KEY, SECRET or PASSWORD"; fi
+  out="$(in_img python3 --version 2>&1)"
+  case "$out" in "Python 3."*) ok "python3 is present ($out)" ;; *) bad "python3: $out" ;; esac
+  for t in bash git make jq curl openssl perl ssh-keygen flock xz awk; do
+    check "the generic tool $t is on the image's PATH" in_img bash -c "command -v $t > /dev/null"
+  done
+  eq "the base carries the key label the launcher gave it" "$(fx_key base)" "$(docker image inspect --format '{{index .Config.Labels "io.github.aames.quokka-ci-kit.image-key"}}' "$BASE_TAG")"
+  check "the entry script is installed and executable" in_img test -x /usr/local/bin/cikit-enter
+  eq "the working directory is the ci user's home" /home/ci "$(in_img pwd)"
+}
+
+enter() { # enter <stdin file> <env assignments...> -- <job>: ENT_RC, $work/ent.out
+  local input="$1" job e args=(); shift
+  for e in "$@"; do if [ "$e" = -- ]; then shift; break; fi; args+=(-e "$e"); shift; done
+  job="$1"
+  ENT_RC=0
+  docker run --rm -i --network none --user 1001:1001 "${args[@]}" "$BASE_TAG" cikit-enter "$job" < "$input" > "$work/ent.out" 2>&1 || ENT_RC=$?
+}
+fam_enter() {
+  local tree commit
+  ready || return 0
+  cd "$FX" || return 0
+  tree="$(git rev-parse 'HEAD^{tree}')"; commit="$(git rev-parse HEAD)"
+  git archive --format=tar -o "$work/tree.tar" HEAD
+  enter "$work/tree.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- alpha
+  rc_is "entry (a): the archive goes in by copy and the adapter runs" 0 "$ENT_RC"
+  has "the tree is the commit's" "$work/ent.out" "The tree in the container is $tree, the commit's."
+  has "and the adapter's counts line reaches the log" "$work/ent.out" "kitfix-ci-job v1 counts alpha unit_tests 3 integration_tests 2"
+  enter "$work/tree.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh ADAPTER_alpha=push -- alpha
+  has "the dead push path: a push towards a GitHub prefix is re-aimed and refused" "$work/ent.out" "push refused"
+  # entry (b): a tree that is not the commit's runs nothing
+  mkdir -p "$work/tamper" && tar -x -f "$work/tree.tar" -C "$work/tamper" && printf 'extra\n' > "$work/tamper/extra-file" && tar -c -f "$work/tampered.tar" -C "$work/tamper" .
+  enter "$work/tampered.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- alpha
+  rc_is "entry (b): an archive that is not the commit's tree" 2 "$ENT_RC"
+  has "is refused in one sentence" "$work/ent.out" "The tree in the container is not the commit's tree, so alpha did not run."
+  hasnt "and the adapter did not run" "$work/ent.out" "counts alpha"
+  # history pack (b): the history job's pack
+  git pack-objects --revs --stdout -q <<< "$commit" > "$work/pack"
+  enter "$work/pack" CIKIT_TREE="$tree" CIKIT_COMMIT="$commit" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- delta
+  rc_is "history pack (b): the commit's pack is indexed and checked out" 0 "$ENT_RC"
+  has "with the whole history named" "$work/ent.out" "The commit in the container is $commit with its history, and its tree is $tree, the commit's."
+  enter "$work/pack" CIKIT_TREE="$tree" CIKIT_COMMIT="$(printf 'a%.0s' $(seq 1 40))" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- delta
+  rc_is "a pack for a commit other than CIKIT_COMMIT" 2 "$ENT_RC"; has "is refused" "$work/ent.out" "is not the commit's tree"
+  printf 'not a pack' > "$work/garbage"
+  enter "$work/garbage" CIKIT_TREE="$tree" CIKIT_COMMIT="$commit" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- delta
+  rc_is "garbage where the pack should be" 2 "$ENT_RC"
+  # the environment's own shape
+  enter "$work/tree.tar" CIKIT_TREE=nothash CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- alpha
+  rc_is "a CIKIT_TREE that is no hash" 2 "$ENT_RC"
+  enter "$work/tree.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=../adapter.sh -- alpha
+  rc_is "a CIKIT_ADAPTER that climbs" 2 "$ENT_RC"
+  enter "$work/tree.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/missing.sh -- alpha
+  rc_is "a CIKIT_ADAPTER the tree lacks" 2 "$ENT_RC"; has "says so" "$work/ent.out" "The tree has no ci/missing.sh, so alpha did not run."
+  enter "$work/tree.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh CIKIT_INSTALL="weird src" -- alpha
+  rc_is "an install kind the kit does not know" 2 "$ENT_RC"; has "says so" "$work/ent.out" "The install kind weird is not one this kit knows"
+  enter "$work/tree.tar" CIKIT_TREE="$tree" CIKIT_PROJECT=kitfix CIKIT_ADAPTER=ci/adapter.sh -- 'Bad Job'
+  rc_is "a job that is not a name" 2 "$ENT_RC"
+  cd "$here" || true
+}
+
+# a real job run under the launcher, held by the fixture (the security review, SECURITY.md)
+# adapter, is read with `docker inspect`: no-new-privileges, every capability
+# dropped and the manifest's uid, on the socket job too. The container is the
+# launcher's own, named kitfix-ci-delta-kitfix-sft-1, and is removed here.
+fam_harden() {
+  local name="kitfix-ci-delta-kitfix-sft-1" i seen=false pid
+  ready || return 0
+  cd "$FX" || return 0
+  sed 's/^env alpha GO_TEST_COUNT/&\nenv delta ADAPTER_MODE/' ci/manifest > "$work/m" && cp "$work/m" ci/manifest
+  git add -A && git commit -qm "delta takes its adapter mode"
+  env -i HOME="$work" TMPDIR="$work" PATH="$KITT_SYS_PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null ADAPTER_MODE=hang \
+    "$BASH" "$KITT_KIT/bin/container" run --run-id kitfix-sft-1 --commit HEAD delta > "$work/harden.out" 2>&1 &
+  pid=$!
+  bg_pids="$bg_pids $pid"
+  for i in $(seq 1 120); do
+    if docker inspect "$name" > /dev/null 2>&1 && docker exec "$name" test -e /home/ci 2> /dev/null; then seen=true; break; fi
+    kill -0 "$pid" 2> /dev/null || break
+    sleep 1
+  done
+  if [ "$seen" != true ]; then
+    bad "the job container $name never came up"; show "$work/harden.out" 15
+    docker rm -f "$name" > /dev/null 2>&1 || true
+    cd "$here" || true
+    return 0
+  fi
+  eq "the real job run drops every capability" "[ALL]" "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$name" | tr '"' ' ' | tr -d ' ' | sed 's/^\[/[/')"
+  eq "and holds no-new-privileges" "[no-new-privileges]" "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$name" | tr '"' ' ' | tr -d ' ')"
+  eq "and runs as the manifest's uid" "1001:1001" "$(docker inspect --format '{{.Config.User}}' "$name")"
+  eq "the process is not root" "1001" "$(docker exec "$name" id -u)"
+  eq "no capability is held (CapEff all zero)" "0000000000000000" "$(docker exec "$name" awk '/^CapEff/ {print $2}' /proc/self/status)"
+  eq "and no_new_privs is set on the process" "1" "$(docker exec "$name" awk '/^NoNewPrivs/ {print $2}' /proc/self/status)"
+  docker rm -f "$name" > /dev/null 2>&1 || true
+  wait "$pid" 2> /dev/null || true
+  img_tags="$img_tags $(docker image ls --format '{{.Repository}}:{{.Tag}}' kitfix-ci-job 2> /dev/null | tr '\n' ' ')"
+  cd "$here" || true
+}
+
+fam_kitjob() {
+  local rc=0 line
+  ready || return 0
+  cd "$FX" || return 0
+  echo "tests/image: running the kit job through the launcher in the base image (several minutes)"
+  env -i HOME="$work" TMPDIR="$work" PATH="$KITT_SYS_PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null "$BASH" "$KITT_KIT/bin/container" run --run-id lct --commit HEAD kitself > "$work/kitjob.out" 2>&1 || rc=$?
+  rc_is "the kit job (tests/run vendored at ci/kit/tests/run) in the base image on $arch" 0 "$rc"
+  line="$(grep '^kitfix-ci-job v1 counts kitself kit_cases ' "$work/kitjob.out" | tail -1)"
+  if [ -n "$line" ]; then ok "and its counts line reaches the log: $line"; else bad "no counts line from the kit job"; tail -25 "$work/kitjob.out"; fi
+  grep -E '^(NOT RUN|FAIL:|cases:)' "$work/kitjob.out" | sed 's/^/    kit job: /'
+  cd "$here" || true
+}
+
+for f in $want; do
+  family="$f"
+  "fam_$f"
+done
+echo "cases: $cases, failures: $failures"
+[ "$failures" -eq 0 ] || exit 1
+echo "${KITT_PROJECT}-ci-job v1 counts ${KITT_JOB} image_cases ${cases}"
