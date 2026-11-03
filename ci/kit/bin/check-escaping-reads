@@ -225,7 +225,8 @@ def escapes(rel, src, lang, tree):
     code, literals = strip_comments(src, lang)
     # Literal contents stay in scope for the helper-name rule, but a comment
     # cannot reach it: `code` has every comment blanked.
-    depth = len(os.path.dirname(rel[len(tree) + 1 :]).split("/"))
+    inner = os.path.dirname(rel[len(tree) + 1 :])
+    depth = len(inner.split("/")) if inner else 0
     reasons = []
 
     def line_of(pos):

@@ -90,6 +90,7 @@ plant("hook-status", "hook", "bin/pre-push", once('"$BASH" "$local_ci" run --com
 for n in range(1, 13):
     plant("workflow-w%d" % n, "workflow", "bin/check-workflow", label(n), "rule W-%d removed" % n)
 plant("escaping-comments", "escaping", "bin/check-escaping-reads", once("    def blank(a, b):\n        for k in range(a, b):", "    def blank(a, b):\n        return\n        for k in range(a, b):"), "the comment stripper bypassed")
+plant("escaping-top-depth", "escaping", "bin/check-escaping-reads", once('    depth = len(inner.split("/")) if inner else 0\n', '    depth = len(inner.split("/"))\n'), "a test directly in its tree counted one level deep (v1.0.0-rc.2)")
 plant("prereq-git", "prereq", "bin/check-prereqs", once('[ "$minor" -lt 34 ]', '[ "$minor" -lt 0 ]'), "the git version check removed")
 plant("launcher-socket", "launcher", "bin/container", once('if m_lists socket "$job"; then socket=true; fi', 'if m_lists socket "$job" || [ "$job" = alpha ]; then socket=true; fi'), "a socket granted to alpha")
 plant("reader-bracket", "reader", "bin/container", once('gsub(/[][(),;]+$/, "", t); ', ''), "the stripping of ] removed")
