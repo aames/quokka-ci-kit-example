@@ -8,6 +8,10 @@
   ___ooo__V__ooo___
 ```
 
+## Use this template
+
+Want this for your own Go or Node repository? Click **Use this template** above, then follow the kit's [QUICKSTART.md](https://github.com/aames/quokka-ci-kit/blob/main/QUICKSTART.md): nine steps from the template to green CI in about 30 minutes, including every rename and which of `api/` and `web/` to keep.
+
 A small project that records quokka sightings on Rottnest Island, built to
 show one CI kit, [quokka-ci-kit](https://github.com/aames/quokka-ci-kit),
 vendored into a real repository. The service is deliberately small; the point
