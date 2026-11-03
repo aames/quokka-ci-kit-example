@@ -1,0 +1,1 @@
+# The keys whose local records CI trusts, one line each: <principal> namespaces="git" <key type> <key>. Each is added in a pull request of its own (DESIGN.md 6.6, 9).

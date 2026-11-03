@@ -1,0 +1,23 @@
+# The kit's one file of this project's facts: the jobs, the paths each job's
+# verdict depends on, the pins, and where the tools and records live. The kit
+# reads it as data (ci/kit/README.md section 3 is the reference); nothing here
+# is executed. `ci/kit/bin/check-manifest` lints it.
+manifest v1
+project @@PROJECT@@
+key-epoch 1
+local-epoch 1
+main-branch @@MAIN@@
+workflow @@WORKFLOW@@
+always-on checks
+adapter @@ADAPTER@@
+kit-job kit
+signers @@SIGNERS@@
+check-command @@CHECK@@
+weekly-cron @@CRON@@
+prune-days 30
+prune-keep-green @@KEEP_GREEN@@
+lock-wait-minutes 30
+refuse-drafts yes
+image ci/image/Dockerfile
+image-path @@IMAGE_PATHS@@
+user 1001

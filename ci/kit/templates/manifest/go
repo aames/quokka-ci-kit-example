@@ -1,0 +1,9 @@
+job @@JOB@@ local
+paths @@JOB@@ @@PATHS@@
+pin @@JOB@@ go
+count @@JOB@@ go_packages go_tests
+cache @@JOB@@ gomod gobuild
+pin-source go toolchain-line @@PIN_FILE@@
+probe go first-line go env GOVERSION
+escaping-tree @@JOB@@ @@DIR@@
+escaping-scan go @@DIR@@

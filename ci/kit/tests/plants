@@ -91,6 +91,9 @@ for n in range(1, 13):
     plant("workflow-w%d" % n, "workflow", "bin/check-workflow", label(n), "rule W-%d removed" % n)
 plant("escaping-comments", "escaping", "bin/check-escaping-reads", once("    def blank(a, b):\n        for k in range(a, b):", "    def blank(a, b):\n        return\n        for k in range(a, b):"), "the comment stripper bypassed")
 plant("escaping-top-depth", "escaping", "bin/check-escaping-reads", once('    depth = len(inner.split("/")) if inner else 0\n', '    depth = len(inner.split("/"))\n'), "a test directly in its tree counted one level deep (v1.0.0-rc.2)")
+plant("manifest-rule6-dot", "manifest", "bin/check-manifest", once('        [ "$p" = . ] || in_tree "$p" || finding', '        in_tree "$p" || finding'), "rule 6's . arm removed (docs/kit-init.md R-2 item 1)")
+plant("escaping-no-scan", "escaping", "bin/check-escaping-reads", once("    if not scans:\n        print(\"The manifest names no escaping-scan line", "    if not scans:\n        return 2\n        print(\"The manifest names no escaping-scan line"), "the no-scan branch restored to exit 2 (R-2 item 2)")
+plant("escaping-dot-depth", "escaping", "bin/check-escaping-reads", once('    inner = os.path.dirname(rel if tree == "." else rel[len(tree) + 1 :])\n', '    inner = os.path.dirname(rel[len(tree) + 1 :])\n'), "the depth under . restored to rel[len(tree) + 1:] (R-2 item 3)")
 plant("prereq-git", "prereq", "bin/check-prereqs", once('[ "$minor" -lt 34 ]', '[ "$minor" -lt 0 ]'), "the git version check removed")
 plant("launcher-socket", "launcher", "bin/container", once('if m_lists socket "$job"; then socket=true; fi', 'if m_lists socket "$job" || [ "$job" = alpha ]; then socket=true; fi'), "a socket granted to alpha")
 plant("reader-bracket", "reader", "bin/container", once('gsub(/[][(),;]+$/, "", t); ', ''), "the stripping of ] removed")
@@ -140,6 +143,22 @@ plant("launcher-ci-condition", "launcher", "bin/container", once('then envs+=(-e
 plant("local-ci-unset-actions", "launcher", "bin/local-ci", once('GIT_OBJECT_DIRECTORY GITHUB_ACTIONS\n', 'GIT_OBJECT_DIRECTORY\n'), "CI=true (c): GITHUB_ACTIONS removed from local-ci's unset")
 plant("keys-reserved-ci", "manifest", "lib/keys.sh", once("PATH HOME CI *_TOKEN", "PATH HOME *_TOKEN"), "CI=true (d): CI removed from the reserved constant")
 plant("keys-reserved-ci-launcher", "launcher", "lib/keys.sh", once("PATH HOME CI *_TOKEN", "PATH HOME *_TOKEN"), "CI=true (d): CI removed from the constant the launcher reads")
+
+# kit-init's five planted defects (docs/kit-init.md section 7.3, AC-KI-28), each one edit of one file of the copy,
+# each seen by the K-init family alone. They are the rules a single deleted line could remove.
+plant("init-existing-refusal", "init", "bin/kit-init", once('            refusals.append("%s already exists%s" % (path, TAIL))', '            pass'), "the refusal of a file it would write that exists removed (AC-KI-4)")
+plant("init-pin-crosscheck", "init", "templates/image/go.Dockerfile", once('[ "$toolchain" = "go${GO_VERSION}" ] || { echo "@@PIN_FILE@@ pins ${toolchain:-no toolchain}, this file go${GO_VERSION}" >&2; exit 1; }', ':'), "the Go pin cross-check removed from the tool's check part (AC-KI-15)")
+plant("init-shim-path", "init", "bin/kit-init", once('shim_path = "ci/kit/hooks/pre-push.shim"', 'shim_path = "ci/kit/bin/pre-push"'), "the hook read from a path other than ci/kit/hooks/pre-push.shim (AC-KI-14)")
+plant("init-check-tokens", "init", "bin/kit-init", once('def check_tokens(plan):\n    bad = []', 'def check_tokens(plan):\n    return\n    bad = []'), "check_tokens disabled, so an unreplaced token passes (AC-KI-19)")
+plant("init-restore-decoded", "init", "bin/kit-init", once('restored.append((path, size))', 'restored.append((path, len(original)))'), "the restore truncating to the decoded length, not the byte length (AC-KI-9)")
+plant("init-utf8-refusal", "init", "bin/kit-init", once('        raise Refused(["%s is not UTF-8 text kit-init can read%s" % (path, TAIL)])', '        return None'), "a file that is not UTF-8 read as absent instead of refused (AC-KI-35)")
+plant("init-offline-branch", "init", "bin/kit-init", once('    if checksums_file is not None:\n        text = read_text(checksums_file)', '    if False:\n        text = read_text(checksums_file)'), "--checksums ignored, so the lookup goes to the network (AC-KI-6)")
+plant("escaping-dot-declared", "escaping", "bin/check-escaping-reads", once('        if not any(within(rel, t) for t in trees.get(job, [])):\n', '        if not any(rel.startswith(t + "/") for t in trees.get(job, [])):\n'), "a declared read's tree test restored to rel.startswith(t + \"/\"), never true for . (docs/kit-init.md rev 3, R3-3; AC-KI-37)")
+plant("init-fixture-walk", "init", "tests/fam/init.sh", once("  ( cd \"$1\" && find . -type f \\( -name '*.go'", "  ( cd \"$1\" && find . -type f -name planted-never \\( -name '*.go'"), "the AC-KI-38 walk disabled, so it finds no file (docs/kit-init.md rev 3, R3-5)")
+plant("init-python-path", "IMAGE:initpy", "templates/image/python.Dockerfile", once("@@@ path\n/usr/local/python/bin\n", "@@@ path\n"), "the pinned Python off the job image's PATH, so the base image's own python3 answers (AC-KI-36)")
+# the security read KI-s (kit-init 3c), findings 1 and 2
+plant("init-symlink-targets", "init", "bin/kit-init", once('    out, seen = [], set()\n    root = os.path.realpath(top)\n', '    return []\n    out, seen = [], set()\n    root = os.path.realpath(top)\n'), "the refusal of a target that is a symbolic link or outside the top removed (KI-s finding 1)")
+plant("init-bounded-values", "init", "bin/kit-init", once('    if value == ".":\n        return True\n    if BOUNDED_RE', '    return True\n    if BOUNDED_RE'), "the bound on directory and file names removed (KI-s finding 2)")
 
 def main(argv):
     only, bash, listing = [], os.environ.get("BASH") or "/bin/bash", False

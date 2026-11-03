@@ -1,0 +1,6 @@
+job @@JOB@@ local
+paths @@JOB@@ @@PATHS@@
+# @@JOB@@'s arm is a stub kit-init wrote: rename its count field and add its
+# pin, pin-source and cache lines when you write the arm and its image block.
+count @@JOB@@ tests
+escaping-tree @@JOB@@ @@DIR@@

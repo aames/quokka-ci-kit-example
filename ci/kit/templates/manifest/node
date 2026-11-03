@@ -1,0 +1,8 @@
+job @@JOB@@ local
+paths @@JOB@@ @@PATHS@@
+pin @@JOB@@ node
+count @@JOB@@ vitest_files vitest_tests
+cache @@JOB@@ npm
+pin-source node first-line @@PIN_FILE@@
+probe node first-line node --version
+escaping-tree @@JOB@@ @@DIR@@

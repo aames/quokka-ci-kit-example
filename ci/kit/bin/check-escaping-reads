@@ -53,8 +53,10 @@ declaration to the key but cannot find an undeclared one. Each run says so.
 
 Usage: check-escaping-reads [--root DIR] [--manifest-file FILE]
 The manifest is DIR's ci/manifest at HEAD, or FILE (a working-tree file, read
-by the same parser). Exit 0 when every escaping file is declared and keyed; 1
-otherwise; 2 when the fence cannot run.
+by the same parser). Exit 0 when every escaping file is declared and keyed,
+and when the manifest names no escaping-scan line and every escaping-read line
+is keyed (it says no file was scanned); 1 otherwise; 2 when the fence cannot
+run, an escaping-scan root holding no test file among them.
 """
 
 import argparse
@@ -225,7 +227,7 @@ def escapes(rel, src, lang, tree):
     code, literals = strip_comments(src, lang)
     # Literal contents stay in scope for the helper-name rule, but a comment
     # cannot reach it: `code` has every comment blanked.
-    inner = os.path.dirname(rel[len(tree) + 1 :])
+    inner = os.path.dirname(rel if tree == "." else rel[len(tree) + 1 :])
     depth = len(inner.split("/")) if inner else 0
     reasons = []
 
@@ -274,6 +276,12 @@ def escapes(rel, src, lang, tree):
     return reasons
 
 
+def within(path, tree):
+    """True when path is the tree or lies under it; a tree of . holds every path
+    (docs/kit-init.md rev 3, R3-3)."""
+    return tree == "." or path == tree or path.startswith(tree + "/")
+
+
 def test_files(root, scans, trees):
     """(rel, lang, tree, job) for every test file under each scan root; a file
     no escaping-tree holds is returned with tree None."""
@@ -290,7 +298,8 @@ def test_files(root, scans, trees):
                     hit = name.endswith("_test.go")
                 else:
                     hit = name.endswith((".ts", ".tsx")) and (
-                        re.search(r"\.test\.tsx?$", name) is not None or rel.startswith(top.rstrip("/") + "/test/")
+                        re.search(r"\.test\.tsx?$", name) is not None
+                        or within(rel, "test" if top.rstrip("/") in (".", "") else top.rstrip("/") + "/test")
                     )
                 if not hit:
                     continue
@@ -370,10 +379,12 @@ def main():
     scanned = {t for _k, t in scans}
     for job, paths in sorted(trees.items()):
         for t in paths:
-            if not any(t == s or s.startswith(t + "/") or t.startswith(s + "/") for s in scanned):
+            if not any(within(s, t) or within(t, s) for s in scanned):
                 print(f"{job + (chr(39) if job.endswith('s') else chr(39) + 's')} tree {t} has no escaping-scan line, so its reads are declared by hand (kit/README.md §3.4).")
     files = test_files(root, scans, trees)
-    if not files:
+    if not scans:
+        print("The manifest names no escaping-scan line, so no file was scanned and only the escaping-read lines were checked against the keys.")
+    elif not files:
         print("the escaping-read fence found no test files, so it would prove nothing.")
         return 2
 
@@ -400,8 +411,8 @@ def main():
         if classes.get(job) not in ("local", "ci-only"):
             failures.append(f"{rel} is declared for {job}, which is not a local or ci-only job.")
             continue
-        if not any(rel.startswith(t + "/") for t in trees.get(job, [])):
-            where = " or ".join(t + "/" for t in trees.get(job, [])) or "no escaping-tree"
+        if not any(within(rel, t) for t in trees.get(job, [])):
+            where = " or ".join("the repository's top" if t == "." else t + "/" for t in trees.get(job, [])) or "no escaping-tree"
             failures.append(f"{rel} is declared for job {job} but is not in {where}.")
         if reads in (["WHOLE-TREE"], ["NONE"]):
             continue
@@ -417,7 +428,10 @@ def main():
               "Declare the read by an escaping-read line and put the path in that job's paths line, or move the check "
               "into the always-on job.")
         return 1
-    print(f"OK: {len(files)} test files scanned, {escaping} build a path out of their tree, every one declared and keyed.")
+    if not scans:
+        print(f"OK: no file was scanned; {len(manifest)} escaping-read lines were checked, and every one is keyed.")
+    else:
+        print(f"OK: {len(files)} test files scanned, {escaping} build a path out of their tree, every one declared and keyed.")
     return 0
 
 

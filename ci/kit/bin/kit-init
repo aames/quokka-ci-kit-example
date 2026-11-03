@@ -1,0 +1,1204 @@
+#!/usr/bin/env python3
+"""KIT-INIT: the generator of an adopter's files (docs/kit-init.md).
+
+  python3 ci/kit/bin/kit-init --project NAME
+          [--go DIR[:JOB]]... [--node DIR[:JOB]]... [--python DIR[:JOB]]...
+          [--postgres JOB[:MAJOR]]...
+          [--signer auto|FILE] [--cron 'M H D M W']
+          [--checksums FILE] [--no-commit] [--no-agent-files]
+  python3 ci/kit/bin/kit-init --agent-files-only
+
+Run once, by hand, at the top of a working copy that has vendored the kit, on
+a branch for the landing pull request. It writes ci/manifest, ci/ci-job.sh,
+ci/image/Dockerfile, .github/workflows/ci.yml, .githooks/pre-push and
+ci/allowed-signers, appends a check target to the Makefile, the stacks' lines
+to .gitignore and the kit's section to AGENTS.md and CLAUDE.md, commits those
+paths alone, then runs the manifest lint, both fences and check-prereqs.
+
+Every file is rendered in memory from ci/kit/templates/ by plain @@TOKEN@@
+substitution, then every refusal is checked, then the files are written. A
+token left unreplaced is a defect, refused like any other.
+
+THE HOST RULE (docs/kit-init.md section 8): standard library only; the
+source parses as Python 3.9; every subprocess is a list whose first element
+is "git", "docker", "ssh-keygen", "bash" or sys.executable, never a shell.
+
+EXIT: 0 written and committed, every check held; 1 written, and a check after
+writing found something or the commit failed (the files stay; the output says
+which); 2 refused, nothing was written; 3 written (and committed unless
+--no-commit), and a check did not run (the output names it and how to run it).
+
+No file is written through a symbolic link or outside the top of the working
+copy, and every directory or file name a generated file carries is bounded to
+letters, digits and . _ / - (the security read KI-s, findings 1 and 2).
+"""
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+if sys.version_info < (3, 9):
+    sys.stderr.write("kit-init needs python3 3.9 or later, and this is %d.%d.%d, so nothing was written.\n"
+                     % tuple(sys.version_info[:3]))
+    sys.exit(2)
+
+# THE KIT'S NAMES, in one block: a separately maintained copy of the kit
+# changes these and its templates, nothing else (docs/kit-init.md 9.3).
+KIT_NAME = "quokka-ci-kit"
+SECTION_BEGIN = "<!-- quokka-ci-kit section begin"
+COMMIT_MESSAGE = "ci: adopt quokka-ci-kit %s"
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+TEMPLATES = os.path.normpath(os.path.join(HERE, "..", "templates"))
+
+TAIL = ", so nothing was written."
+STACKS = ("go", "node", "python")
+STACK_NAME = {"go": "Go", "node": "Node", "python": "Python"}
+RESERVED_JOBS = {"checks": "kit-init's always-on job", "kit": "kit-init's kit job",
+                 "prune": "kit-init's prune job", "image": "a word the manifest keeps for the job image",
+                 "base": "a word the manifest keeps for the base image"}
+NAME_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+PROJECT_RE = re.compile(r"^[a-z][a-z0-9]{1,15}$")
+CRON_WORD_RE = re.compile(r"^[A-Za-z0-9*,/-]+$")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+# a directory or file name that reaches a generated file (the security read KI-s, finding 2)
+BOUNDED_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+BOUNDED_SHAPE = ("., or letters, digits and . _ / - starting with a letter or digit, with no .. segment")
+# the kit's own file names a pin file or lockfile may end in; at the top (.) these start with a dot
+KIT_FILE_NAMES = ("go.mod", "go.sum", ".nvmrc", ".node-version", "package-lock.json", ".python-version")
+KEY_TYPES = ("ssh-ed25519", "ssh-rsa", "ssh-dss", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+             "ecdsa-sha2-nistp521", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com")
+
+GO_INDEX = "https://go.dev/dl/?mode=json&include=all"
+NODE_SUMS = "https://nodejs.org/dist/v%s/SHASUMS256.txt"
+PBS_RELEASES = "https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=10"
+PBS_NAME = "cpython-%s+%s-%s-unknown-linux-gnu-install_only_stripped.tar.gz"
+ARCH_NAMES = {"go": ("linux-amd64", "linux-arm64"), "node": ("linux-x64", "linux-arm64"),
+              "python": ("x86_64", "aarch64")}
+
+OUTPUTS = ("ci/manifest", "ci/ci-job.sh", "ci/image/Dockerfile", ".github/workflows/ci.yml",
+           ".githooks/pre-push", "ci/allowed-signers")
+ADAPTER, WORKFLOW, SIGNERS, CHECK = "ci/ci-job.sh", ".github/workflows/ci.yml", "ci/allowed-signers", "make check"
+DEFAULT_CRON = "20 6 * * 1"
+
+# The closed set of tokens. A template naming any other is a defect.
+TOKENS = {
+    "PROJECT", "PROJECT_UPPER", "JOB", "FN", "DIR", "JOBS", "CRON", "MAIN", "ADAPTER", "WORKFLOW",
+    "CHECK", "SIGNERS", "VERSION", "SHA256_AMD64", "SHA256_ARM64", "PBS_TAG", "DIGEST", "PATHS",
+    "IMAGE_PATHS", "KEEP_GREEN", "PIN_FILE", "PIN_BASE", "SCAN_DIR", "LOCKFILE", "REQUIREMENTS",
+    "NEED_BINS", "TSC_STEP", "SERVICE_CHECK", "CASES", "OUTPUTS", "CACHES", "ARGS", "PIN_FILES",
+    "CROSS_CHECKS", "AMD64", "ARM64", "TOOL_NAMES", "FETCH", "FINISH", "ENV",
+    "LINES_JOB", "LINES_PATHS", "LINES_PIN", "LINES_COUNT", "LINES_INSTALL", "LINES_SERVICE",
+    "LINES_CACHE", "LINES_PIN_SOURCE", "LINES_PROBE", "LINES_ESCAPING_TREE", "LINES_ESCAPING_SCAN",
+}
+TOKEN_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
+MANIFEST_GROUPS = ("job", "paths", "pin", "count", "install", "service", "cache", "pin-source", "probe",
+                   "escaping-tree", "escaping-scan")
+
+
+class Refused(Exception):
+    """One or more refusal sentences; exit 2, nothing written."""
+
+    def __init__(self, sentences):
+        super().__init__("\n".join(sentences))
+        self.sentences = list(sentences)
+
+
+# --- subprocesses: the closed set, each a list, never a shell -------------
+
+def git(*args, check=False, stdin=None):
+    return subprocess.run(["git", *args], input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, check=check)
+
+
+def docker(*args):
+    return subprocess.run(["docker", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+
+def ssh_keygen(*args):
+    return subprocess.run(["ssh-keygen", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+
+def bash(*args, capture=False):
+    if capture:
+        return subprocess.run(["bash", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True)
+    sys.stdout.flush()
+    return subprocess.run(["bash", *args])
+
+
+def python(*args, quiet=False):
+    """sys.executable in isolated mode (-I): neither the current directory nor PYTHON* variables reach
+    sys.path, so a yaml.py at the repository's top is never imported (the security read KI-s, finding 3)."""
+    sys.stdout.flush()
+    out = subprocess.DEVNULL if quiet else None
+    return subprocess.run([sys.executable, "-I", *args], stdout=out, stderr=out)
+
+
+def git_value(*args):
+    r = git(*args)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+# --- the command line -------------------------------------------------------
+
+VALUE_FLAGS = ("--project", "--go", "--node", "--python", "--postgres", "--signer", "--cron", "--checksums")
+BOOL_FLAGS = ("--no-commit", "--no-agent-files", "--agent-files-only")
+USAGE = """usage: python3 ci/kit/bin/kit-init --project NAME
+        [--go DIR[:JOB]]... [--node DIR[:JOB]]... [--python DIR[:JOB]]...
+        [--postgres JOB[:MAJOR]]...
+        [--signer auto|FILE] [--cron 'M H D M W']
+        [--checksums FILE] [--no-commit] [--no-agent-files]
+       python3 ci/kit/bin/kit-init --agent-files-only
+A stack kit-init does not know is declared by hand after the run: its job, paths
+and count lines in ci/manifest, its arm in ci/ci-job.sh, its toolchain in
+ci/image/Dockerfile and its job in .github/workflows/ci.yml."""
+
+
+def parse_args(argv):
+    opts = {"project": None, "stacks": [], "postgres": [], "signer": None, "cron": None, "checksums": None,
+            "no_commit": False, "no_agent_files": False, "agent_files_only": False}
+    seen = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(USAGE)
+            sys.exit(0)
+        flag, eq, value = arg.partition("=")
+        if flag in VALUE_FLAGS:
+            if not eq:
+                if i + 1 >= len(argv):
+                    raise Refused(["%s needs a value%s" % (flag, TAIL)])
+                value = argv[i + 1]
+                i += 1
+            seen.append(flag)
+            name = flag[2:]
+            if name in STACKS:
+                opts["stacks"].append((name, value))
+            elif name == "postgres":
+                opts["postgres"].append(value)
+            else:
+                if opts[name] is not None:
+                    raise Refused(["%s is given twice%s" % (flag, TAIL)])
+                opts[name] = value
+        elif arg in BOOL_FLAGS:
+            seen.append(arg)
+            opts[arg[2:].replace("-", "_")] = True
+        elif arg.startswith("-"):
+            raise Refused(["%s is not a stack kit-init knows (it knows --go, --node and --python)%s"
+                           % (flag, TAIL)])
+        else:
+            raise Refused(["%s is not a flag; kit-init takes flags only%s" % (arg, TAIL)])
+        i += 1
+    if opts["agent_files_only"]:
+        others = [f for f in seen if f != "--agent-files-only"]
+        if others:
+            raise Refused(["--agent-files-only takes no other flag, and %s was given%s" % (others[0], TAIL)])
+    elif opts["project"] is None:
+        raise Refused(["kit-init needs --project NAME%s" % TAIL])
+    return opts
+
+
+# --- templates ----------------------------------------------------------------
+
+def template(name):
+    with open(os.path.join(TEMPLATES, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def template_parts(name):
+    """A template of named parts: each part opens with a line `@@@ <name>`."""
+    parts, current = {}, None
+    for line in template(name).splitlines():
+        if line.startswith("@@@ "):
+            current = line[4:].strip()
+            parts[current] = []
+        elif current is not None:
+            parts[current].append(line)
+    return parts
+
+
+def render(text, values, label):
+    """Plain substitution. A line that is one token alone and whose value is
+    empty is dropped; a token outside the closed set is a defect."""
+    for name in TOKEN_RE.findall(text):
+        if name not in TOKENS:
+            raise Refused(["%s names the token @@%s@@, which kit-init does not know; that is a defect of "
+                           "the templates%s" % (label, name, TAIL)])
+    lines = []
+    for line in text.split("\n"):
+        m = TOKEN_RE.fullmatch(line.strip())
+        if m and values.get(m.group(1)) == "":
+            continue
+        lines.append(TOKEN_RE.sub(lambda t: values.get(t.group(1), t.group(0)), line))
+    return "\n".join(lines)
+
+
+def render_parts(parts, values, label):
+    return {k: render("\n".join(v), values, label) for k, v in parts.items()}
+
+
+def squeeze(text):
+    """One blank line at most between blocks; one newline at the end."""
+    out = []
+    for line in text.split("\n"):
+        if line == "" and (not out or out[-1] == ""):
+            continue
+        out.append(line)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out) + "\n"
+
+
+# --- the census of the working copy --------------------------------------------
+
+def join(directory, name):
+    return name if directory == "." else directory + "/" + name
+
+
+def covers(directory, path):
+    return directory == "." or path == directory or path.startswith(directory + "/")
+
+
+def read_text(path):
+    """The file's text with its line ends read as LF, or None when it cannot be
+    opened; a file that is not UTF-8 is a refusal (docs/kit-init.md R-1 b)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused(["%s is not UTF-8 text kit-init can read%s" % (path, TAIL)])
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def path_problem(d):
+    if d == ".":
+        return None
+    if not d or d.startswith("/") or d.startswith("-") or re.search(r"[\s*?\[\]\\:]", d):
+        return "an absolute path, white space or one of * ? [ ] \\ : or a leading -"
+    if any(seg in ("", ".", "..") for seg in d.split("/")):
+        return "a . or .. segment"
+    return None
+
+
+def bounded(value):
+    """True when the value may reach a generated file: ., or BOUNDED_RE with no empty, . or .. segment, or such
+    a directory (or .) followed by one of the kit's own file names (KI-s, finding 2)."""
+    if value == ".":
+        return True
+    if BOUNDED_RE.fullmatch(value) and not any(seg in ("", ".", "..") for seg in value.split("/")):
+        return True
+    head, name = os.path.split(value)
+    return name in KIT_FILE_NAMES and bounded(head or ".")
+
+
+def census_job(stack, spec, refusals):
+    """One stack flag: its directory, job, pin and the runner kit-init knows."""
+    directory, _, job = spec.partition(":")
+    directory = directory.rstrip("/") or "."
+    problem = path_problem(directory)
+    if problem:
+        refusals.append("%s is not a directory the manifest accepts (it holds %s)%s" % (directory, problem, TAIL))
+        return None
+    if not bounded(directory):
+        refusals.append("%s is not a directory name kit-init writes into a generated file (a directory is %s)%s"
+                        % (directory, BOUNDED_SHAPE, TAIL))
+        return None
+    if not job:
+        job = stack if directory == "." else directory.replace("/", "-")
+    j = {"stack": stack, "dir": directory, "job": job, "stub": False, "pin": None, "pin_file": None,
+         "lockfile": None, "tsc": False, "scan_dir": directory, "requirements": None}
+    if not os.path.isdir(directory):
+        refusals.append("%s is not a directory in this working copy%s" % (directory, TAIL))
+        return None
+    if stack == "go":
+        gomod = join(directory, "go.mod")
+        text = read_text(gomod)
+        if text is None:
+            refusals.append("%s has no go.mod, so it is not a Go directory and nothing was written." % directory)
+            return None
+        j["pin_file"] = gomod
+        line = next((ln.split() for ln in text.splitlines() if ln.split()[:1] == ["toolchain"]), None)
+        if not line or len(line) < 2:
+            refusals.append('%s has no toolchain line, and the job image is pinned from it; add one such as '
+                            '"toolchain go1.27.3"%s' % (gomod, TAIL))
+            return j
+        if not re.fullmatch(r"go\d+\.\d+\.\d+", line[1]):
+            refusals.append('%s pins "%s", which is not an exact version such as go1.27.3%s' % (gomod, line[1], TAIL))
+            return j
+        j["pin"] = line[1][2:]
+        gosum = join(directory, "go.sum")
+        j["lockfile"] = gosum if os.path.isfile(gosum) else gomod
+    elif stack == "node":
+        pkg_path = join(directory, "package.json")
+        pkg = read_text(pkg_path)
+        if pkg is None:
+            refusals.append("%s has no package.json, so it is not a Node directory and nothing was written."
+                            % directory)
+            return None
+        pin_file = next((join(directory, n) for n in (".nvmrc", ".node-version")
+                         if os.path.isfile(join(directory, n))), None)
+        if pin_file is None:
+            refusals.append("%s has no .nvmrc or .node-version, and the job image is pinned from it; add one "
+                            "holding an exact version such as 24.22.1%s" % (directory, TAIL))
+            return j
+        j["pin_file"] = pin_file
+        value = "".join((read_text(pin_file) or "").split("\n", 1)[0].split())
+        if not re.fullmatch(r"v?\d+\.\d+\.\d+", value):
+            refusals.append('%s holds "%s", which is not an exact version such as 24.22.1%s' % (pin_file, value, TAIL))
+            return j
+        j["pin"] = value.lstrip("v")
+        try:
+            data = json.loads(pkg)
+        except ValueError:
+            refusals.append("%s is not JSON kit-init can read%s" % (pkg_path, TAIL))
+            return j
+        deps = {}
+        for key in ("dependencies", "devDependencies"):
+            if isinstance(data.get(key), dict):
+                deps.update(data[key])
+        lock = join(directory, "package-lock.json")
+        j["lockfile"] = lock if os.path.isfile(lock) else None
+        j["stub"] = "vitest" not in deps or j["lockfile"] is None
+        j["tsc"] = os.path.isfile(join(directory, "tsconfig.json"))
+        src = join(directory, "src")
+        j["scan_dir"] = src if os.path.isdir(src) else directory
+    else:
+        pin_file = join(directory, ".python-version")
+        text = read_text(pin_file)
+        if text is None:
+            refusals.append("%s has no .python-version, and the job image is pinned from it; a range such as "
+                            "pyproject.toml's requires-python is not a pin%s" % (directory, TAIL))
+            return None
+        j["pin_file"] = pin_file
+        value = "".join(text.split("\n", 1)[0].split())
+        if not re.fullmatch(r"\d+\.\d+\.\d+", value):
+            refusals.append('%s holds "%s", which is not an exact version such as 3.12.7%s' % (pin_file, value, TAIL))
+            return j
+        j["pin"] = value
+        for name in sorted(os.listdir(directory)):
+            if re.fullmatch(r"requirements[\w.-]*\.txt", name):
+                body = read_text(join(directory, name)) or ""
+                if "--hash=" in body and re.search(r"(?im)^\s*pytest\b", body):
+                    j["requirements"] = name
+                    break
+        j["stub"] = j["requirements"] is None
+    return j
+
+
+def census(opts, refusals):
+    jobs = []
+    for stack, spec in opts["stacks"]:
+        j = census_job(stack, spec, refusals)
+        if j:
+            jobs.append(j)
+    for j in jobs:
+        # every value a template carries, read from the repository or built from the directory (KI-s, finding 2)
+        for value in (j["pin_file"], j["lockfile"], j["scan_dir"], j["requirements"]):
+            if value is not None and not bounded(value):
+                refusals.append("%s is not a file name kit-init writes into a generated file (a name is %s)%s"
+                                % (value, BOUNDED_SHAPE, TAIL))
+    names = {}
+    for j in jobs:
+        name = j["job"]
+        why = None
+        if name in RESERVED_JOBS:
+            why = "it is %s" % RESERVED_JOBS[name]
+        elif not NAME_RE.fullmatch(name) or len(name) > 32:
+            why = "a job name is lower-case letters and digits in words joined by -, at most 32 characters"
+        elif name in names:
+            why = "%s and %s would both be named %s" % (names[name], j["dir"], name)
+        if why:
+            refusals.append("%s cannot name a job (%s); give the directory a name with DIR:JOB%s" % (name, why, TAIL))
+        names.setdefault(name, j["dir"])
+    by_job = {j["job"]: j for j in jobs}
+    for spec in opts["postgres"]:
+        job, _, major = spec.partition(":")
+        major = major or "18"
+        if job not in by_job:
+            refusals.append("--postgres names %s, which no stack flag declared%s" % (job, TAIL))
+        elif not re.fullmatch(r"[0-9]+", major):
+            refusals.append("--postgres %s names the major %s, which is not a number such as 18%s" % (job, major, TAIL))
+        elif "postgres" in by_job[job]:
+            refusals.append("--postgres names %s twice; a job has one service%s" % (job, TAIL))
+        else:
+            by_job[job]["postgres"] = major
+    first = {}
+    for j in jobs:
+        if j["stub"] or not j["pin"]:
+            continue
+        f = first.setdefault(j["stack"], j)
+        if f["pin"] != j["pin"]:
+            prefix = "go" if j["stack"] == "go" else ""
+            refusals.append("%s pins %s%s and %s %s%s, and the job image carries one %s%s"
+                            % (f["pin_file"], prefix, f["pin"], j["pin_file"], prefix, j["pin"],
+                               STACK_NAME[j["stack"]], TAIL))
+    return jobs, first
+
+
+# --- checksums and digests (docs/kit-init.md section 4) ---------------------
+
+def tool_files(tool, version, tag=None):
+    if tool == "go":
+        return ["go%s.%s.tar.gz" % (version, a) for a in ARCH_NAMES["go"]]
+    if tool == "node":
+        return ["node-v%s-%s.tar.xz" % (version, a) for a in ARCH_NAMES["node"]]
+    return [PBS_NAME % (version, tag or "<tag>", a) for a in ARCH_NAMES["python"]]
+
+
+def source_of(tool, version):
+    return {"go": GO_INDEX, "node": NODE_SUMS % version, "python": PBS_RELEASES}[tool]
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "kit-init (%s)" % KIT_NAME})
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (https only, fixed hosts)
+        return resp.read().decode("utf-8")
+
+
+def parse_sums(text):
+    sums = {}
+    for line in text.splitlines():
+        m = re.match(r"^([0-9a-f]{64})\s+\*?(\S+)\s*$", line.strip())
+        if m:
+            sums[m.group(2)] = m.group(1)
+    return sums
+
+
+def lookup_values(tools, majors, checksums_file, refusals):
+    """{tool: (sha_amd64, sha_arm64, tag, source)}, {major: (digest, source)}."""
+    found, digests = {}, {}
+    if checksums_file is not None:
+        text = read_text(checksums_file)
+        if text is None:
+            refusals.append("--checksums %s cannot be read%s" % (checksums_file, TAIL))
+            return found, digests
+        sums = parse_sums(text)
+        for tool, version in tools.items():
+            tag = None
+            if tool == "python":
+                tags = set()
+                for name in sums:
+                    m = re.fullmatch(re.escape("cpython-%s+" % version) + r"(\d+)-x86_64-unknown-linux-gnu-"
+                                     r"install_only_stripped\.tar\.gz", name)
+                    if m and (PBS_NAME % (version, m.group(1), "aarch64")) in sums:
+                        tags.add(m.group(1))
+                tag = max(tags) if tags else None
+            names = tool_files(tool, version, tag)
+            missing = [n for n in names if n not in sums]
+            for n in missing:
+                refusals.append("--checksums %s has no sha256 for %s; its project publishes it at %s, as a line "
+                                "\"<64 hex>  <file name>\"%s" % (checksums_file, n, source_of(tool, version), TAIL))
+            if not missing:
+                found[tool] = (sums[names[0]], sums[names[1]], tag, checksums_file)
+        for major in majors:
+            name = "postgres:%s" % major
+            if name in sums:
+                digests[major] = (sums[name], checksums_file)
+            else:
+                refusals.append("--checksums %s has no index digest for %s; `docker buildx imagetools inspect %s` "
+                                "prints it, as a line \"<64 hex>  %s\"%s" % (checksums_file, name, name, name, TAIL))
+        return found, digests
+    for tool, version in tools.items():
+        try:
+            found[tool] = fetch_tool(tool, version)
+        except Exception as e:  # any failure of a lookup is one refusal per value, naming its URL
+            names = tool_files(tool, version)
+            for n in names:
+                refusals.append("The sha256 of %s could not be fetched from %s (%s); fetch it yourself and pass it "
+                                "with --checksums%s" % (n, source_of(tool, version), e, TAIL))
+    for major in majors:
+        name = "postgres:%s" % major
+        r = docker("buildx", "imagetools", "inspect", name)
+        m = re.search(r"(?m)^Digest:\s+sha256:([0-9a-f]{64})\s*$", r.stdout) if r.returncode == 0 else None
+        if m:
+            digests[major] = (m.group(1), "docker buildx imagetools inspect %s" % name)
+        else:
+            refusals.append("The index digest of %s could not be read from `docker buildx imagetools inspect %s`; "
+                            "pass it with --checksums%s" % (name, name, TAIL))
+    return found, digests
+
+
+def fetch_tool(tool, version):
+    if tool == "go":
+        index = json.loads(fetch(GO_INDEX))
+        want = "go%s" % version
+        rel = next((r for r in index if r.get("version") == want), None)
+        if rel is None:
+            raise ValueError("%s is not in the index" % want)
+        shas = []
+        for arch in ("amd64", "arm64"):
+            f = next((f for f in rel.get("files", []) if f.get("os") == "linux" and f.get("arch") == arch
+                      and f.get("kind") == "archive"), None)
+            if not f or not HEX64_RE.fullmatch(f.get("sha256", "")):
+                raise ValueError("no linux-%s archive for %s" % (arch, want))
+            shas.append(f["sha256"])
+        return shas[0], shas[1], None, GO_INDEX
+    if tool == "node":
+        url = NODE_SUMS % version
+        sums = parse_sums(fetch(url))
+        names = tool_files("node", version)
+        if any(n not in sums for n in names):
+            raise ValueError("a linux tarball line is missing")
+        return sums[names[0]], sums[names[1]], None, url
+    releases = json.loads(fetch(PBS_RELEASES))
+    for rel in releases:
+        tag = rel.get("tag_name", "")
+        assets = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", [])}
+        names = tool_files("python", version, tag)
+        if all(n in assets for n in names) and "SHA256SUMS" in assets:
+            url = assets["SHA256SUMS"]
+            if not url.startswith("https://"):
+                raise ValueError("SHA256SUMS is not served over https")
+            sums = parse_sums(fetch(url))
+            if all(n in sums for n in names):
+                return sums[names[0]], sums[names[1]], tag, url
+    raise ValueError("no release on the most recent page carries cpython %s for both architectures" % version)
+
+
+# --- the signer (docs/kit-init.md section 3.8) ------------------------------
+
+def key_from_line(line):
+    words = line.split()
+    if len(words) < 2 or words[0] not in KEY_TYPES:
+        return None
+    try:
+        base64.b64decode(words[1], validate=True)
+    except ValueError:
+        return None
+    return words[0] + " " + words[1]
+
+
+def signer_key(signer, refusals):
+    if signer == "auto":
+        bad = "--signer auto needs gpg.format ssh and a user.signingkey whose public key can be read" + TAIL
+        if git_value("config", "gpg.format") != "ssh":
+            refusals.append(bad)
+            return None
+        sk = git_value("config", "user.signingkey")
+        if sk.startswith("key::"):
+            key = key_from_line(sk[5:])
+        elif sk:
+            path = os.path.expanduser(sk)
+            if not path.endswith(".pub") and os.path.isfile(path + ".pub"):
+                path += ".pub"
+            text = read_text(path) if path.endswith(".pub") else None
+            key = key_from_line(text.strip().splitlines()[0]) if text and text.strip() else None
+        else:
+            key = None
+        if key is None:
+            refusals.append(bad)
+        return key
+    text = read_text(signer)
+    lines = [ln for ln in (text or "").splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    key = key_from_line(lines[0]) if len(lines) == 1 else None
+    if key is None:
+        refusals.append("%s holds no single SSH public key line of a type the signers check knows%s" % (signer, TAIL))
+    return key
+
+
+# --- rendering ------------------------------------------------------------------
+
+def prose(names, quote=""):
+    items = ["%s%s%s" % (quote, n, quote) for n in names]
+    if len(items) < 2:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def render_all(ctx):
+    """Every file kit-init creates, as {path: text}, rendered in memory."""
+    jobs, first, values = ctx["jobs"], ctx["first"], ctx["values"]
+    project = ctx["project"]
+    base = {"PROJECT": project, "PROJECT_UPPER": project.upper(), "MAIN": ctx["main"], "CRON": ctx["cron"],
+            "ADAPTER": ADAPTER, "WORKFLOW": WORKFLOW, "SIGNERS": SIGNERS, "CHECK": CHECK}
+    tools = [t for t in STACKS if t in first]
+    tools.sort(key=lambda t: jobs.index(first[t]))
+    image_paths = ["ci/image"] + [first[t]["pin_file"] for t in tools]
+    stack_jobs = [j["job"] for j in jobs]
+    out = {}
+
+    def job_values(j):
+        v = dict(base)
+        v.update({"JOB": j["job"], "FN": j["job"].replace("-", "_"), "DIR": j["dir"],
+                  "PIN_FILE": j["pin_file"] or "", "SCAN_DIR": j["scan_dir"], "LOCKFILE": j["lockfile"] or "",
+                  "REQUIREMENTS": j["requirements"] or ""})
+        paths = [j["dir"]] + [p for p in image_paths if not covers("ci", p) and not covers(j["dir"], p)] + ["ci"]
+        v["PATHS"] = " ".join(paths)
+        if "postgres" in j:
+            v["VERSION"] = j["postgres"]
+            v["DIGEST"] = ctx["digests"][j["postgres"]][0]
+        return v
+
+    # ci/manifest
+    head = dict(base, KEEP_GREEN=" ".join(["checks"] + stack_jobs + ["kit"]), IMAGE_PATHS=" ".join(image_paths))
+    groups = {g: [] for g in MANIFEST_GROUPS}
+    for j in jobs:
+        v = job_values(j)
+        parts = ["manifest/stub" if j["stub"] else "manifest/" + j["stack"]]
+        if j["stack"] == "node":
+            parts.append("manifest/node-scan")
+            if not j["stub"] and j["lockfile"]:
+                parts.append("manifest/node-npm-ci")
+        if "postgres" in j:
+            parts.append("manifest/postgres")
+        for name in parts:
+            pending = []
+            for line in render(template(name), v, name).splitlines():
+                if not line.strip():
+                    continue
+                if line.startswith("#"):
+                    pending.append(line)
+                    continue
+                directive = line.split()[0]
+                if directive not in groups:
+                    raise Refused(["%s holds the directive %s, which kit-init does not place; that is a defect of "
+                                   "the templates%s" % (name, directive, TAIL)])
+                if directive in ("pin-source", "probe") and first.get(j["stack"]) is not j:
+                    pending = []
+                    continue
+                groups[directive].extend(pending + [line])
+                pending = []
+    tail = dict(base, JOBS=prose(stack_jobs) or "no stack jobs")
+    for g in MANIFEST_GROUPS:
+        tail["LINES_" + g.upper().replace("-", "_")] = "\n".join(groups[g])
+    out["ci/manifest"] = squeeze(render(template("manifest/head"), head, "manifest/head") + "\n"
+                                 + render(template("manifest/tail"), tail, "manifest/tail"))
+
+    # ci/ci-job.sh
+    text = render(template("adapter/head.sh"), base, "adapter/head.sh")
+    cases = []
+    for j in jobs:
+        v = job_values(j)
+        v["SERVICE_CHECK"] = (render(template("adapter/postgres.sh"), v, "adapter/postgres.sh").rstrip("\n")
+                              if "postgres" in j else "")
+        if j["stub"]:
+            name = "adapter/stub.sh"
+        else:
+            name = {"go": "adapter/go.sh", "node": "adapter/node-vitest.sh",
+                    "python": "adapter/python-pytest.sh"}[j["stack"]]
+        if j["stack"] == "node":
+            v["NEED_BINS"] = ("[ -x node_modules/.bin/tsc ] && [ -x node_modules/.bin/vitest ]" if j["tsc"]
+                              else "[ -x node_modules/.bin/vitest ]")
+            v["TSC_STEP"] = render(template("adapter/node-tsc.sh"), v, "adapter/node-tsc.sh").rstrip("\n") \
+                if j["tsc"] else ""
+        text += render(template(name), v, name)
+        cases.append(render(template("adapter/case.sh"), v, "adapter/case.sh").rstrip("\n"))
+    text += render(template("adapter/tail.sh"), dict(base, CASES="\n".join(cases)), "adapter/tail.sh")
+    out["ci/ci-job.sh"] = squeeze(text)
+
+    # ci/image/Dockerfile
+    text = render(template("image/head.Dockerfile"), base, "image/head.Dockerfile")
+    if tools:
+        rendered = {}
+        for t in tools:
+            j = first[t]
+            sha_amd64, sha_arm64, tag, _src = values[t]
+            v = dict(base, VERSION=j["pin"], SHA256_AMD64=sha_amd64, SHA256_ARM64=sha_arm64, PBS_TAG=tag or "",
+                     PIN_FILE=j["pin_file"], PIN_BASE=os.path.basename(j["pin_file"]))
+            name = "image/%s.Dockerfile" % t
+            rendered[t] = render_parts(template_parts(name), v, name)
+
+        def part(key):
+            return [rendered[t][key] for t in tools if rendered[t].get(key, "") != ""]
+
+        def run_lines(key):
+            return "\n".join("    %s; \\" % ln for p in part(key) for ln in p.split("\n"))
+
+        names = [rendered[t]["name"] for t in tools]
+        dirs = " ".join(part("dirs"))
+        finish = "    rm -rf %s" % " ".join(part("tmp") + ["/pins"])
+        if dirs:
+            finish += "; \\\n    install -d -o ci -g ci %s" % dirs
+        env = "ENV PATH=%s" % ":".join(part("path") + ["/usr/local/bin", "/usr/bin", "/bin"])
+        for p in part("env"):
+            for ln in p.split("\n"):
+                env += " \\\n    " + ln
+        comments = "\n".join(part("env-comment"))
+        v = dict(base, ARGS="\n".join(part("args")), PIN_FILES=" ".join(first[t]["pin_file"] for t in tools),
+                 CROSS_CHECKS=run_lines("check"), AMD64="; ".join(part("amd64")), ARM64="; ".join(part("arm64")),
+                 TOOL_NAMES=(", ".join(names[:-1]) + " or " + names[-1]) if len(names) > 1 else names[0],
+                 FETCH=run_lines("fetch"), FINISH=finish, ENV=(comments + "\n" + env) if comments else env)
+        text += render(template("image/run.Dockerfile"), v, "image/run.Dockerfile")
+    else:
+        text += "\n"
+    text += render(template("image/tail.Dockerfile"), base, "image/tail.Dockerfile")
+    out["ci/image/Dockerfile"] = squeeze(text)
+
+    # .github/workflows/ci.yml
+    o = template_parts("workflow/output.yml")
+    all_jobs = ["checks"] + stack_jobs + ["kit"]
+    outputs = [render("\n".join(o[k]), dict(base, JOB=n), "workflow/output.yml")
+               for k in ("decision", "key") for n in all_jobs]
+    text = render(template("workflow/head.yml"), dict(base, OUTPUTS="\n".join(outputs)), "workflow/head.yml")
+    for j in jobs:
+        v = job_values(j)
+        kinds = []
+        if not j["stub"]:
+            kinds = {"go": ["gomod", "gobuild"], "node": ["npm"], "python": []}[j["stack"]]
+        v["CACHES"] = "".join(render(template("workflow/cache-%s.yml" % k), v, "workflow/cache-%s.yml" % k)
+                              for k in kinds).rstrip("\n")
+        text += render(template("workflow/local-job.yml"), v, "workflow/local-job.yml")
+    text += render(template("workflow/kit-job.yml"), base, "workflow/kit-job.yml")
+    text += render(template("workflow/prune.yml"), base, "workflow/prune.yml")
+    out[".github/workflows/ci.yml"] = squeeze(text)
+
+    out[".githooks/pre-push"] = ctx["shim"]
+    out["ci/allowed-signers"] = render(template("allowed-signers"), base, "allowed-signers")
+    return out
+
+
+def render_makefile(base, local_jobs):
+    return render(template("Makefile.check"), dict(base, JOBS=" ".join(local_jobs)), "Makefile.check")
+
+
+def render_section(base, local_jobs):
+    v = dict(base, JOBS=prose(local_jobs, "`"))
+    return render(template("agents/section.md"), v, "agents/section.md")
+
+
+def appended(existing, block):
+    if existing is None or existing == "":
+        return block
+    return existing + ("\n" if existing.endswith("\n") else "\n\n") + block
+
+
+# --- writing --------------------------------------------------------------------
+
+def write_all(plan):
+    """plan: [(path, text, mode, original or None)]. On a failure, remove the
+    files this run created, truncate appended files to the byte length they had
+    on disk before the append (os.stat, never the length of the LF-read text:
+    docs/kit-init.md R-1 a), and remove only the directories this run made."""
+    created, restored, dirs = [], [], []
+    try:
+        for path, text, mode, original in plan:
+            parent = os.path.dirname(path)
+            missing = []
+            while parent and not os.path.isdir(parent):
+                missing.append(parent)
+                parent = os.path.dirname(parent)
+            for d in reversed(missing):
+                os.mkdir(d)
+                dirs.append(d)
+            data = text if isinstance(text, bytes) else text.encode("utf-8")
+            if original is None:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+                created.append(path)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    os.fchmod(f.fileno(), mode)
+            else:
+                # O_NOFOLLOW: an append never goes through a symbolic link (KI-s, finding 1)
+                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+                with os.fdopen(fd, "ab") as f:
+                    size = os.fstat(f.fileno()).st_size
+                    restored.append((path, size))
+                    f.write(data[len(original.encode("utf-8")):])
+    except BaseException as e:
+        for path in created:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        for path, size in restored:
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+                try:
+                    os.ftruncate(fd, size)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+        for d in reversed(dirs):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+        if isinstance(e, OSError):
+            raise Refused(["kit-init could not write (%s); it removed the files it had created%s" % (e, TAIL)])
+        raise
+
+
+class InitDir:
+    """<git common dir>/<project>-ci/init/: scratch files, removed at exit
+    but for allowed-signers.next (docs/kit-init.md 2.4, AC-KI-8)."""
+
+    def __init__(self, common, project):
+        self.state = os.path.join(common, "%s-ci" % project)
+        self.path = os.path.join(self.state, "init")
+        self.made_state = not os.path.isdir(self.state)
+        os.makedirs(self.path, exist_ok=True)
+        self.scratch = []
+
+    def file(self, name, text):
+        path = os.path.join(self.path, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        self.scratch.append(path)
+        return path
+
+    def close(self):
+        for path in self.scratch:
+            if os.path.basename(path) != "allowed-signers.next":
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        for d in (self.path, self.state if self.made_state else None):
+            if d:
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+
+
+# --- the run --------------------------------------------------------------------
+
+def preflight_repo():
+    top = git_value("rev-parse", "--show-toplevel")
+    if not top or os.path.realpath(top) != os.path.realpath(os.getcwd()):
+        raise Refused(["kit-init runs at the top of a git working copy" + TAIL])
+    if not (os.path.isfile("ci/kit/lib/keys.sh") and os.path.isfile("ci/KIT-VERSION")):
+        raise Refused(["There is no ci/kit/lib/keys.sh or ci/KIT-VERSION; vendor the kit with kit-update first" + TAIL])
+    # the tag is read here, once, so a ci/KIT-VERSION that is not UTF-8 is refused before anything is written
+    # (docs/kit-init.md rev 3, R3-2); nothing after write_all reads the file
+    tag = next((ln.split()[1] for ln in (read_text("ci/KIT-VERSION") or "").splitlines()
+                if ln.split()[:1] == ["tag"] and len(ln.split()) > 1), "(no tag)")
+    common = git_value("rev-parse", "--git-common-dir")
+    return os.path.realpath(os.path.join(top, common)), tag
+
+
+def target_refusals(paths, top):
+    """KI-s, finding 1: before anything is written, refuse an output target, or any directory above one, that is
+    a symbolic link, or whose real path lies outside the top of the working copy. One sentence per path."""
+    out, seen = [], set()
+    root = os.path.realpath(top)
+    for path in paths:
+        parts = path.split("/")
+        for k in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:k])
+            if prefix in seen:
+                break
+            if os.path.islink(os.path.join(top, prefix)):
+                seen.add(prefix)
+                out.append("%s is a symbolic link, and kit-init writes no file through one%s" % (prefix, TAIL))
+                break
+        else:
+            real = os.path.realpath(os.path.join(top, path))
+            if real != root and not real.startswith(root + os.sep) and path not in seen:
+                seen.add(path)
+                out.append("%s lies outside the top of this working copy (%s)%s" % (path, real, TAIL))
+    return out
+
+
+def refuse_targets(plan):
+    """The plan's paths through target_refusals, at the top (preflight_repo made the working directory it)."""
+    refusals = target_refusals([p for p, _t, _m, _o in plan], os.getcwd())
+    if refusals:
+        raise Refused(refusals)
+
+
+def section_refusals(skip):
+    out = []
+    if skip:
+        return out
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        text = read_text(name)
+        if text is not None and SECTION_BEGIN in text:
+            out.append("%s already holds the %s section%s" % (name, KIT_NAME, TAIL))
+    return out
+
+
+def agent_plan(base, local_jobs):
+    plan = []
+    block = render_section(base, local_jobs)
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        original = read_text(name)
+        plan.append((name, appended(original, block), 0o644, original))
+    return plan
+
+
+def agent_files_only():
+    preflight_repo()
+    refusals = section_refusals(False)
+    r = bash("ci/kit/bin/keys", "dump", "HEAD", capture=True)
+    if r.returncode != 0:
+        refusals.append("HEAD carries no ci/manifest the kit accepts (%s)%s"
+                        % (r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "keys dump failed", TAIL))
+    if refusals:
+        raise Refused(refusals)
+    d, jobs = {}, []
+    for line in r.stdout.splitlines():
+        words = line.split("\t")
+        if words[0] == "job" and len(words) == 3 and words[2] == "local":
+            jobs.append(words[1])
+        d.setdefault(words[0], words[1:])
+    base = {"ADAPTER": d["adapter"][0], "WORKFLOW": d["workflow"][0], "SIGNERS": d["signers"][0],
+            "CHECK": "\t".join(d["check-command"]), "MAIN": d["main-branch"][0]}
+    plan = agent_plan(base, jobs)
+    check_tokens(plan)
+    refuse_targets(plan)
+    write_all(plan)
+    for path, _t, _m, original in plan:
+        print("%s %s" % ("appended" if original else "wrote", path))
+    print("Commit AGENTS.md and CLAUDE.md in a pull request of their own; kit-init did not commit them.")
+    return 0
+
+
+def check_tokens(plan):
+    bad = []
+    for path, text, _mode, _orig in plan:
+        if isinstance(text, str):
+            for name in sorted(set(TOKEN_RE.findall(text))):
+                bad.append("%s would hold the unreplaced token @@%s@@, a defect of kit-init%s" % (path, name, TAIL))
+    if bad:
+        raise Refused(bad)
+
+
+def cron_day(cron):
+    words = cron.split()
+    days = {"0": "Sunday", "1": "Monday", "2": "Tuesday", "3": "Wednesday", "4": "Thursday", "5": "Friday",
+            "6": "Saturday", "7": "Sunday"}
+    if (len(words) == 5 and words[0].isdigit() and words[1].isdigit() and words[2] == "*" and words[3] == "*"
+            and words[4] in days):
+        return "%s %02d:%02d UTC" % (days[words[4]], int(words[1]), int(words[0]))
+    return "the schedule %s, UTC" % cron
+
+
+def main(argv):
+    opts = parse_args(argv)
+    if opts["agent_files_only"]:
+        return agent_files_only()
+    common, kit_tag = preflight_repo()
+    refusals = []
+    project = opts["project"]
+    if not PROJECT_RE.fullmatch(project):
+        refusals.append("%s is not a project name the manifest accepts (a lower-case letter, then 1 to 15 lower-case "
+                        "letters or digits)%s" % (project, TAIL))
+    cron = opts["cron"] if opts["cron"] is not None else DEFAULT_CRON
+    if len(cron.split()) != 5 or not all(CRON_WORD_RE.fullmatch(w) for w in cron.split()):
+        refusals.append("--cron '%s' is not five cron words such as '%s'%s" % (cron, DEFAULT_CRON, TAIL))
+    cron = " ".join(cron.split())
+    jobs, first = census(opts, refusals)
+    for path in OUTPUTS:
+        if os.path.lexists(path):
+            refusals.append("%s already exists%s" % (path, TAIL))
+    makefile = read_text("Makefile")
+    if makefile is not None and re.search(r"(?m)^check\s*::?(?!=)", makefile):
+        refusals.append("The Makefile already has a check target" + TAIL)
+    refusals.extend(section_refusals(opts["no_agent_files"]))
+    email = git_value("config", "user.email")
+    if (not opts["no_commit"] or opts["signer"]) and not (git_value("config", "user.name") and email):
+        refusals.append("git has no user.name or user.email here, and the adoption commit and the signer's principal "
+                        "need them" + TAIL)
+    branch = git_value("symbolic-ref", "-q", "--short", "HEAD")
+    origin_head = git_value("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+    main_branch = origin_head.split("/", 1)[1] if origin_head.startswith("origin/") else "main"
+    if not opts["no_commit"] and not branch:
+        refusals.append("HEAD is detached, and kit-init commits on a branch for its own pull request" + TAIL)
+    elif not opts["no_commit"] and branch == main_branch:
+        refusals.append("kit-init commits the adoption on a branch for its own pull request, and this is %s%s"
+                        % (main_branch, TAIL))
+    key = signer_key(opts["signer"], refusals) if opts["signer"] else None
+    if refusals:
+        raise Refused(refusals)
+
+    tools = {t: first[t]["pin"] for t in STACKS if t in first}
+    majors = sorted({j["postgres"] for j in jobs if "postgres" in j})
+    values, digests = lookup_values(tools, majors, opts["checksums"], refusals)
+    if refusals:
+        raise Refused(refusals)
+    for t in sorted(values, key=lambda t: jobs.index(first[t])):
+        a, b, tag, src = values[t]
+        names = tool_files(t, tools[t], tag)
+        print("%s %s from %s" % (names[0], a, src))
+        print("%s %s from %s" % (names[1], b, src))
+    for major in majors:
+        print("postgres:%s sha256:%s from %s" % (major, digests[major][0], digests[major][1]))
+
+    shim_path = "ci/kit/hooks/pre-push.shim"
+    with open(shim_path, "rb") as f:
+        shim = f.read()
+    ctx = {"project": project, "main": main_branch, "main_guessed": not origin_head.startswith("origin/"),
+           "cron": cron, "jobs": jobs, "first": first, "values": values, "digests": digests, "shim": shim}
+    files = render_all(ctx)
+    base = {"PROJECT": project, "MAIN": main_branch, "ADAPTER": ADAPTER, "WORKFLOW": WORKFLOW, "SIGNERS": SIGNERS,
+            "CHECK": CHECK}
+    local_jobs = [j["job"] for j in jobs] + ["kit"]
+    plan = []
+    for path in OUTPUTS:
+        mode = 0o755 if path in ("ci/ci-job.sh", ".githooks/pre-push") else 0o644
+        plan.append((path, files[path], mode, None))
+    plan.append(("Makefile", appended(makefile, render_makefile(base, local_jobs)), 0o644, makefile))
+    ignore = read_text(".gitignore")
+    have = {ln.strip().strip("/") for ln in (ignore or "").splitlines()}
+    wanted = []
+    for stack, line in (("node", "node_modules/"), ("python", "__pycache__/")):
+        if any(j["stack"] == stack for j in jobs) and line.strip("/") not in have and line not in wanted:
+            wanted.append(line)
+    if wanted:
+        plan.append((".gitignore", appended(ignore, "".join(w + "\n" for w in wanted)), 0o644, ignore))
+    if not opts["no_agent_files"]:
+        plan.extend(agent_plan(base, local_jobs))
+    check_tokens(plan)
+    refuse_targets(plan)
+
+    init = InitDir(common, project)
+    try:
+        scratch = init.file("manifest", files["ci/manifest"])
+        r = bash("ci/kit/bin/check-manifest", "--file", scratch, capture=True)
+        if r.returncode != 0:
+            sys.stdout.write(r.stdout)
+            raise Refused(["The manifest kit-init would write does not pass check-manifest" + TAIL])
+        signer_line = fingerprint = None
+        if key:
+            pub = init.file("signer.pub", key + "\n")
+            r = ssh_keygen("-lf", pub)
+            m = re.search(r"\bSHA256:\S+", r.stdout) if r.returncode == 0 else None
+            if not m:
+                raise Refused(["%s holds no single SSH public key line of a type the signers check knows%s"
+                               % (opts["signer"], TAIL)])
+            fingerprint = m.group(0)
+            signer_line = '%s namespaces="git" %s' % (email, key)
+
+        write_all(plan)
+        for path, _t, _m, original in plan:
+            print("%s %s" % ("appended to" if original else "wrote", path))
+        rc = 0
+        if not opts["no_commit"]:
+            paths = [p for p, _t, _m, _o in plan]
+            vend = git("status", "--porcelain", "--", "ci/kit", "ci/KIT-VERSION", "ci/KIT-SIGNERS").stdout
+            for p in ("ci/kit", "ci/KIT-VERSION", "ci/KIT-SIGNERS"):
+                if any(ln[3:].rstrip("/") == p or ln[3:].startswith(p + "/") for ln in vend.splitlines()):
+                    paths.append(p)
+            step = git("add", "--", *paths)
+            which = "git add"
+            if step.returncode == 0:
+                step = git("commit", "-q", "-m", COMMIT_MESSAGE % kit_tag, "--", *paths)
+                which = "git commit"
+            if step.returncode == 0:
+                print("committed %s: %s" % (git_value("rev-parse", "--short", "HEAD"), COMMIT_MESSAGE % kit_tag))
+            else:
+                said = next((ln.strip() for ln in (step.stderr + step.stdout).splitlines() if ln.strip()),
+                            "no message")
+                print("The files are written but the commit failed (%s exited %d: %s), so nothing is committed; "
+                      "commit them yourself, then run the checks below." % (which, step.returncode, said))
+                rc = 1
+        print()
+        print("The checks, each exit code as it stands:")
+        if opts["no_commit"]:
+            checks = [("check-manifest", ["ci/kit/bin/check-manifest", "--file", "ci/manifest"], "bash")]
+            extra = ["--manifest-file", "ci/manifest"]
+        else:
+            checks = [("check-manifest", ["ci/kit/bin/check-manifest"], "bash")]
+            extra = []
+        has_yaml = python("-c", "import yaml", quiet=True).returncode == 0
+        checks += [("check-workflow", ["ci/kit/bin/check-workflow"] + extra, "python"),
+                   ("check-escaping-reads", ["ci/kit/bin/check-escaping-reads"] + extra, "python"),
+                   ("check-prereqs", ["ci/kit/bin/check-prereqs"], "bash")]
+        codes, not_run = {}, []
+        for name, args, runner in checks:
+            if name == "check-workflow" and not has_yaml:
+                # exit 3, never 0, when a check did not run (KI-s, finding 4)
+                print("NOT RUN check-workflow: this python3 (%s) has no PyYAML; install it and run python3 "
+                      "ci/kit/bin/check-workflow%s yourself; CI's always-on job runs it too."
+                      % (sys.executable, "".join(" " + a for a in extra)))
+                not_run.append(name)
+                continue
+            code = (bash(*args) if runner == "bash" else python(*args)).returncode
+            codes[name] = code
+            print("%s: exit %d" % (name, code))
+            if code != 0:
+                rc = 1
+        if signer_line:
+            init.file("allowed-signers.next", signer_line + "\n")
+        no_tests = codes.get("check-manifest") == 0 and codes.get("check-escaping-reads") == 2
+        closing(ctx, jobs, branch, signer_line, fingerprint, os.path.join(init.path, "allowed-signers.next"), no_tests,
+                not_run, extra)
+        if rc == 0 and not_run:
+            rc = 3
+        return rc
+    finally:
+        init.close()
+
+
+def closing(ctx, jobs, branch, signer_line, fingerprint, next_path, no_tests=False, not_run=(), extra=()):
+    stack_jobs = [j["job"] for j in jobs]
+    real = [j["job"] for j in jobs if not j["stub"]]
+    stubs = [j["job"] for j in jobs if j["stub"]]
+    steps = []
+    if no_tests:
+        # the fence refused "found no test files" while the manifest passed: the scan lines stay written and the
+        # way forward comes first (docs/kit-init.md rev 3, R3-4; AC-KI-39)
+        scans = []
+        for j in jobs:
+            # the directories of the escaping-scan lines the templates write: a Go job's own, a Node job's scan root
+            d = j["scan_dir"] if j["stack"] == "node" else j["dir"] if j["stack"] == "go" and not j["stub"] else None
+            w = "the repository's top" if d == "." else d
+            if d is not None and w not in scans:
+                scans.append(w)
+        steps.append("Write a first test in %s, commit it, and run python3 ci/kit/bin/check-escaping-reads again; "
+                     "CI's checks job refuses this tree until you do." % prose(scans or ["your stack directories"]))
+    steps.append("make check (the first run builds the base and job images and takes several minutes).")
+    if real:
+        steps.append("After it passes: %s." % "; ".join("bash ci/kit/bin/check-adapter %s" % n for n in real))
+    if stubs:
+        steps.append("Fill in the stub arm of %s in ci/ci-job.sh and its toolchain in ci/image/Dockerfile, then run "
+                     "the steps above again." % prose(stubs))
+    steps += [
+        "Copy the residual paragraph of the kit's DESIGN.md section 3.4 into your own documentation before you trust "
+        "a local record.",
+        "Protect %s: pull requests only, signed commits required, no force pushes." % ctx["main"],
+        "Confirm a skipped required check reports success, with a scratch pull request (DESIGN.md section 4 item 7).",
+        "Require these checks on %s: %s." % (ctx["main"], ", ".join(["checks"] + stack_jobs + ["kit"])),
+        "On each workstation: git config core.hooksPath .githooks; git config gpg.format ssh; "
+        "git config user.signingkey <your public key>.",
+        "Merge origin/%s into this branch, then push it with git push --no-verify -u origin %s; this once only, so "
+        "CI runs every job and writes the first green records." % (ctx["main"], branch or "<branch>"),
+        "Open the pull request saying that its local records are refused until a signer is on %s." % ctx["main"],
+    ]
+    if signer_line:
+        steps.append("After it merges, add your signer to ci/allowed-signers in a pull request of its own: %s "
+                     "(fingerprint %s; kept in %s)." % (signer_line, fingerprint, next_path))
+    else:
+        steps.append("After it merges, add your signer to ci/allowed-signers in a pull request of its own: the line "
+                     "is <your git user.email> namespaces=\"git\" followed by the first two words of your public key "
+                     "file, and ssh-keygen -lf <your public key file> prints the fingerprint to confirm out of band.")
+    steps.append("Read the summary of the first scheduled run on its day: %s." % cron_day(ctx["cron"]))
+    print()
+    if ctx.get("main_guessed"):
+        # KI-s, finding 6: the guess is said, and how to make it an answer
+        print("kit-init took the main branch to be main, because origin/HEAD is not set here. If it is another "
+              "branch, run git remote set-head origin -a, reset this branch to before the adoption commit and run "
+              "kit-init again.")
+    for name in not_run:
+        print("%s did not run, so this run proves nothing about it: install PyYAML for python3 and run python3 "
+              "ci/kit/bin/%s%s before you push." % (name, name, "".join(" " + a for a in extra)))
+    print("Next, in order:")
+    for n, s in enumerate(steps, 1):
+        print("%2d. %s" % (n, s))
+    hand = [j["job"] for j in jobs if j["stack"] == "python"]
+    if hand:
+        print("Declared by hand: %s is Python, which no scanner reads, so its escaping reads are a census by hand "
+              "(ci/kit/README.md section 3.4)." % prose(hand))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Refused as r:
+        for s in r.sentences:
+            sys.stderr.write(s + "\n")
+        sys.exit(2)
