@@ -21,6 +21,13 @@ fam_escaping() {
   printf 'package a\n\nvar _ = repoRoot\n' > "$FX/src/a/b_test.go"
   esc_run "a repository-root helper" 1 "src/a/b_test.go builds a path out of src/"
   rm -f "$FX/src/a/b_test.go"
+  # a test file directly in its tree is depth zero, so one .. leaves it (v1.0.0-rc.2)
+  printf 'package src\n\nimport ("path/filepath")\n\nvar _ = filepath.Join("..", "web", "x")\n' > "$FX/src/top_test.go"
+  esc_run "a test directly in its tree climbing one .. out, undeclared" 1 "src/top_test.go builds a path out of src/ and is not declared by an escaping-read line"
+  has "and it is counted from depth zero" "$work/o" "src/top_test.go:5: a path call climbs 1 \`..\` from 0 below src/"
+  printf 'package src\n\nimport ("path/filepath")\n\nvar _ = filepath.Join("web", "x")\n' > "$FX/src/top_test.go"
+  esc_run "the same test reading inside its tree" 0 "OK: "
+  rm -f "$FX/src/top_test.go"
   printf 'import { join } from "path"\nconst p = join(process.cwd(), "..", "x")\n' > "$FX/src/web/y.test.ts"
   esc_run "a TypeScript test climbing from the tree" 1 "src/web/y.test.ts builds a path out of src/"
   printf '// join(process.cwd(), "..", "x") and repoRoot\nexport const y = 1\n' > "$FX/src/web/y.test.ts"
