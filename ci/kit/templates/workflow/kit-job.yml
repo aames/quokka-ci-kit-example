@@ -1,0 +1,36 @@
+
+  kit:
+    name: kit
+    needs: checks
+    if: needs.checks.outputs.kit == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-kit-${{ needs.checks.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - name: The job image
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA" kit
+      - name: The kit's own proofs, vendored
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" kit
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.checks.outputs.kit_key }}
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/record kit "$KEY" "$SHA"

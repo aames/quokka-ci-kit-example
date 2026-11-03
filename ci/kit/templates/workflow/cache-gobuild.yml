@@ -1,0 +1,8 @@
+      - name: Date stamp for the build cache key
+        id: gobuild
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Cache the Go build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/@@PROJECT@@-ci-gobuild
+          key: @@PROJECT@@-ci-gobuild-${{ runner.os }}-${{ steps.gobuild.outputs.date }}

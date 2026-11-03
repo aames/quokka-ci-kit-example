@@ -5,7 +5,7 @@
 # entry script's tree-in with a fixture archive and a fixture pack (K-enter),
 # and the kit job itself run through the launcher in that base.
 #
-#   bash kit/tests/image [--family image|enter|harden|kitjob]...
+#   bash kit/tests/image [--family image|enter|harden|kitjob|initgo|initpy]...
 #
 # It runs where a socket is held (the kit repository's `kitsrc` job, an
 # adopter's socket-holding job, a workstation with Docker running) and never
@@ -16,6 +16,11 @@
 # Exit 0 all held; 1 a case failed; 2 Docker does not answer. On success it
 # ends with
 #   ${CIKIT_PROJECT}-ci-job v1 counts ${CIKIT_JOB} image_cases <n>
+#
+# initgo and initpy are the kit-init end-to-end shapes (docs/kit-init.md section 7.3; AC-KI-29, AC-KI-36): each
+# generates an adopter into a scratch repository with the kit under test vendored, then runs `make check`
+# through the real launcher and `check-adapter` on each stack job. They fetch toolchains, Postgres and wheels
+# from the network and build a job image, which takes several minutes each.
 # shellcheck disable=SC2154,SC2034,SC2016
 set -uo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,10 +31,10 @@ want=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --family) want="$want $2"; shift 2 ;;
-    *) echo "usage: image [--family image|enter|harden|kitjob]..." >&2; exit 2 ;;
+    *) echo "usage: image [--family image|enter|harden|kitjob|initgo|initpy]..." >&2; exit 2 ;;
   esac
 done
-[ -n "$want" ] || want="image enter harden kitjob"
+[ -n "$want" ] || want="image enter harden kitjob initgo initpy"
 if ! command -v docker > /dev/null 2>&1 || ! docker info > /dev/null 2>&1; then
   echo "tests/image: Docker does not answer docker info, so nothing ran." >&2
   exit 2
@@ -170,6 +175,109 @@ fam_kitjob() {
   if [ -n "$line" ]; then ok "and its counts line reaches the log: $line"; else bad "no counts line from the kit job"; tail -25 "$work/kitjob.out"; fi
   grep -E '^(NOT RUN|FAIL:|cases:)' "$work/kitjob.out" | sed 's/^/    kit job: /'
   cd "$here" || true
+}
+
+# --- kit-init end to end (AC-KI-29, AC-KI-36) -----------------------------------------------------
+
+# e2e_repo <name> <project>: a scratch adopter on branch adopt with the whole kit under test vendored (tests
+# included, because the generated kit job runs ci/kit/tests/run) and ci/KIT-VERSION; E2E is it.
+e2e_repo() {
+  local f
+  E2E="$work/$1"; E2E_PROJECT="$2"
+  rm -rf "$E2E"
+  git init -q --initial-branch=main "$E2E"
+  git -C "$E2E" config user.name e2e; git -C "$E2E" config user.email e2e@fixture
+  printf 'readme\n' > "$E2E/README.md"
+  git -C "$E2E" add -A && git -C "$E2E" commit -qm init
+  git -C "$E2E" checkout -q -b adopt
+  mkdir -p "$E2E/ci/kit"
+  for f in bin lib hooks image templates tests; do cp -R "$KITT_KIT/$f" "$E2E/ci/kit/$f"; done
+  git -C "$E2E" add -A && git -C "$E2E" commit -qm vendor
+  printf 'tag v1.1.0-rc.1\ncommit %s\ntree %s\nsigner e2e@fixture\nvendored 2026-11-03\n' \
+    "$(git -C "$E2E" rev-parse HEAD)" "$(git -C "$E2E" rev-parse HEAD:ci/kit)" > "$E2E/ci/KIT-VERSION"
+  git -C "$E2E" add -A && git -C "$E2E" commit -qm version
+}
+# e2e_cp <fixture dir> <dest dir>: copy a fixture tree, each NAME.fixture placed as NAME (docs/kit-init.md rev 3,
+# R3-5: the kit stores no file a test runner collects by default, so its sources carry .fixture).
+e2e_cp() {
+  local f
+  mkdir -p "$2"
+  cp -R "$1/." "$2/"
+  ( cd "$1" && find . -type f -name '*.fixture' ) | while IFS= read -r f; do mv "$2/$f" "$2/${f%.fixture}"; done
+}
+# e2e <command...>: in the scratch adopter, on the host as it is (Docker, git, make), the way an adopter runs
+# it; E2E_RC and $work/e2e.out (both streams).
+e2e() {
+  E2E_RC=0
+  ( cd "$E2E" && env -i HOME="$work" TMPDIR="$work" PATH="$KITT_SYS_PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 "$@" ) > "$work/e2e.out" 2>&1 || E2E_RC=$?
+}
+# e2e_counts <job>: the last counts line of that job in the driver's saved log.
+e2e_counts() { cat "$E2E"/.git/"$E2E_PROJECT"-ci/logs/"$1"-*.log 2> /dev/null | grep "^${E2E_PROJECT}-ci-job v1 counts $1 " | tail -1; }
+e2e_images() { # remove what the run built: the project's base and job images
+  local t
+  for t in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2> /dev/null | grep -E "^${E2E_PROJECT}-ci-(base|job)(-base)?:" || true); do img_tags="$img_tags $t"; done
+}
+# e2e_shape <label> <fixture dir> <kit-init args...>: generate, make check, check-adapter; leaves $work/e2e-check.out.
+e2e_generate() {
+  local label="$1"; shift
+  local started
+  started="$(date +%s)"
+  e2e "${PYYAML:-python3}" ci/kit/bin/kit-init "$@"
+  rc_is "$label: kit-init writes, commits and its checks hold" 0 "$E2E_RC"
+  [ "$E2E_RC" -eq 0 ] || { show "$work/e2e.out" 30; return 1; }
+  has "$label: the adoption is committed" "$work/e2e.out" "committed "
+  eq "$label: and the tree is clean" "" "$(git -C "$E2E" status --porcelain)"
+  return 0
+}
+e2e_check() { # e2e_check <label> <jobs, space separated, the stack jobs then kit>
+  local label="$1" jobs="$2" job started
+  started="$(date +%s)"
+  echo "tests/image: $label: make check (the job image builds on the first run; several minutes)"
+  e2e make check
+  rc_is "$label: make check passes every job through the real launcher" 0 "$E2E_RC"
+  cp "$work/e2e.out" "$work/e2e-check.out"
+  [ "$E2E_RC" -eq 0 ] || { tail -40 "$work/e2e.out"; return 1; }
+  echo "tests/image: $label: make check took $(( $(date +%s) - started )) s"
+  for job in $jobs; do
+    has "$label: $job passed" "$work/e2e-check.out" "$job passed"
+  done
+  return 0
+}
+
+fam_initgo() {
+  local f line
+  e2e_repo e2e-go rottnest
+  mkdir -p "$E2E/api" "$E2E/web"
+  e2e_cp "$KITT_FIX/init/e2e/api" "$E2E/api"; e2e_cp "$KITT_FIX/init/e2e/web" "$E2E/web"
+  git -C "$E2E" add -A && git -C "$E2E" commit -qm "the example's api and web at 8ad9623"
+  e2e_generate "AC-KI-29 [go, node, postgres]" --project rottnest --go api --node web --postgres api --checksums "$KITT_FIX/init/checksums" --no-agent-files || { e2e_images; return 0; }
+  e2e_check "AC-KI-29 [go, node, postgres]" "api web kit" || { e2e_images; return 0; }
+  e2e_images
+  # the counts lines the launcher saw, one per job, each above zero
+  for line in "api go_packages " "web vitest_files " "kit kit_cases "; do
+    case "$(e2e_counts "${line%% *}")" in *"counts $line"[1-9]*) ok "AC-KI-29 [go, node, postgres]: the saved log of ${line%% *} holds a counts line with ${line#* }above zero: $(e2e_counts "${line%% *}")" ;; *) bad "AC-KI-29 [go, node, postgres]: no counts line [$line] above zero in the saved log of ${line%% *}: [$(e2e_counts "${line%% *}")]" ;; esac
+  done
+  for job in api web; do
+    e2e bash ci/kit/bin/check-adapter "$job"
+    rc_is "AC-KI-29 [go, node, postgres]: check-adapter $job" 0 "$E2E_RC"
+    [ "$E2E_RC" -eq 0 ] || show "$work/e2e.out" 20
+  done
+  e2e_images
+}
+
+fam_initpy() {
+  e2e_repo e2e-py pyshape
+  mkdir -p "$E2E/py"
+  e2e_cp "$KITT_FIX/init/e2e-python" "$E2E/py"
+  git -C "$E2E" add -A && git -C "$E2E" commit -qm "a Python project: pytest, hashed requirements"
+  e2e_generate "AC-KI-36 [python]" --project pyshape --python py --checksums "$KITT_FIX/init/checksums" --no-agent-files || { e2e_images; return 0; }
+  e2e_check "AC-KI-36 [python]" "py kit" || { e2e_images; return 0; }
+  e2e_images
+  eq "AC-KI-36 [python]: the counts line carries pytest_tests 4, the fixture's four passing tests" "pyshape-ci-job v1 counts py pytest_tests 4" "$(e2e_counts py)"
+  e2e bash ci/kit/bin/check-adapter py
+  rc_is "AC-KI-36 [python]: check-adapter py" 0 "$E2E_RC"
+  [ "$E2E_RC" -eq 0 ] || show "$work/e2e.out" 20
+  e2e_images
 }
 
 for f in $want; do

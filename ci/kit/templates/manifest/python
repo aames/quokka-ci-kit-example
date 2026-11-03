@@ -1,0 +1,9 @@
+job @@JOB@@ local
+paths @@JOB@@ @@PATHS@@
+pin @@JOB@@ python
+count @@JOB@@ pytest_tests
+pin-source python first-line @@PIN_FILE@@
+probe python version-flag python3
+# @@JOB@@ is Python, which no scanner reads: its escaping reads are a census by
+# hand, written as escaping-read lines (ci/kit/README.md section 3.4).
+escaping-tree @@JOB@@ @@DIR@@

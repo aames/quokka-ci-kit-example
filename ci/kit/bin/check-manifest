@@ -225,7 +225,7 @@ for ((i = 0; i < nrec; i++)); do
       [ -n "$tree" ] || continue
       if [ "$DIR" = escaping-tree ]; then set -- "${W[@]:2}"; else set -- "${W[2]}"; fi
       for p in "$@"; do
-        in_tree "$p" || finding "$LINE" "${DIR} names ${p}, which does not exist at ${tree:0:8}."
+        [ "$p" = . ] || in_tree "$p" || finding "$LINE" "${DIR} names ${p}, which does not exist at ${tree:0:8}."
       done
       ;;
   esac

@@ -1,0 +1,29 @@
+
+# checks runs on every run; @@JOBS@@ run on a workstation (make check) or in
+# CI; kit runs the vendored kit's own proofs.
+job checks always-on
+@@LINES_JOB@@
+job kit local
+
+# A job's key is a hash of these paths at the commit. `ci` holds the kit, this
+# manifest, the adapter, the image and the signers file, so a change to any of
+# them runs every job; each job image input outside a job's own directory is
+# in that job's key too.
+paths checks .
+@@LINES_PATHS@@
+paths kit ci
+
+@@LINES_PIN@@
+@@LINES_COUNT@@
+count kit kit_cases
+@@LINES_INSTALL@@
+@@LINES_SERVICE@@
+@@LINES_CACHE@@
+
+@@LINES_PIN_SOURCE@@
+@@LINES_PROBE@@
+
+# The escaping-read fence: a test file may read only inside its own job's
+# trees unless an escaping-read line below declares what it reads.
+@@LINES_ESCAPING_TREE@@
+@@LINES_ESCAPING_SCAN@@

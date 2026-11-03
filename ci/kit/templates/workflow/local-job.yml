@@ -1,0 +1,37 @@
+
+  @@JOB@@:
+    name: @@JOB@@
+    needs: checks
+    if: needs.checks.outputs.@@JOB@@ == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: ci-@@JOB@@-${{ needs.checks.outputs.ref_group }}
+      cancel-in-progress: true
+    env:
+      CIKIT_IMAGE_CACHE: gha
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Expose the Actions cache runtime to the image build
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+@@CACHES@@
+      - name: The job image
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container image --commit "$SHA"
+      - name: The @@JOB@@ verdict
+        env:
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/container run --commit "$SHA" @@JOB@@
+      - name: Record this tree green
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ needs.checks.outputs.@@JOB@@_key }}
+          SHA: ${{ needs.checks.outputs.sha }}
+        run: bash ci/kit/bin/record @@JOB@@ "$KEY" "$SHA"

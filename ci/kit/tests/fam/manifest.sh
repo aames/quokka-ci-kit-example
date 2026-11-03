@@ -95,6 +95,13 @@ fam_manifest() {
   lint_rule 6 "an escaping-read outside its job's tree" 's#^escaping-read alpha|src/a/a_test.go|#escaping-read alpha|obs/x_test.go|#' "which is not inside an escaping-tree of alpha."
   lint_rule 6 "an escaping-read whose outside path the key lacks" 's#^escaping-read alpha|src/a/a_test.go|deploy/tool.sh|#escaping-read alpha|src/a/a_test.go|docs/x.md|#' "which the key of alpha does not cover"
   lint_rule 6 "an escaping-tree that does not exist" 's#^escaping-tree beta obs#escaping-tree beta nothere#' "escaping-tree names nothere, which does not exist"
+  # AC-KI-32 (docs/kit-init.md rev 2, R-2 item 1): a path of . exists at every commit
+  fx_reset
+  sed -e 's#^escaping-tree beta obs#escaping-tree beta .#' -e 's#^escaping-scan go src$#escaping-scan go .#' "$FX/ci/manifest" > "$work/m" && cp "$work/m" "$FX/ci/manifest"
+  git -C "$FX" commit -qam "rule 6 dot"
+  rc=0; KIT_KEYS_REPO="$FX" "$BASH" "$KITT_KIT/bin/check-manifest" --commit HEAD --no-vendor-check > "$work/o" 2>&1 || rc=$?
+  rc_is "rule 6, an escaping-tree and an escaping-scan of . (AC-KI-32)" 0 "$rc"
+  hasnt "rule 6, a path of . is not called missing (AC-KI-32)" "$work/o" "names ., which does not exist at"
   lint_rule 9 "an image-path no local key covers" 's#^image-path ci/image tools.sh src/go.mod#image-path ci/image tools.sh src/go.mod extra/dir#' "image-path names extra/dir"
   lint_rule 9 "an image outside every image-path" 's#^image ci/image/Dockerfile#image ci/Dockerfile#' "image names ci/Dockerfile, which is under no image-path PATH."
   lint_rule 9 "a socket naming a CI-only job" 's#^socket delta#socket beta#' "socket names beta, which is not a local job."

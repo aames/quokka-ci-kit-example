@@ -1,0 +1,98 @@
+# CI for @@PROJECT@@, in the vendored kit's shape (ci/kit/README.md; the kit's
+# DESIGN.md section 5.6). kit-init wrote it from ci/kit/templates/workflow/.
+#
+# `checks` runs first on every run. Its Plan step computes each job's key (a
+# hash of the paths ci/manifest lists for it) and looks for a record of that
+# key: a green record CI wrote, or a signed local record a workstation's
+# `make check` and pre-push hook wrote. A job whose key has a trusted record
+# is skipped; every other job runs. The plan's summary table shows which, and
+# on what record.
+#
+# On the weekly schedule the plan ignores every local record, so each job runs
+# in CI unless CI itself already passed that exact tree: the independent check.
+#
+# Each job's timeout-minutes is a starting value: set it by measuring the job
+# (the kit's DESIGN.md section 11).
+name: CI
+
+on:
+  pull_request:
+    branches: [@@MAIN@@]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [@@MAIN@@]
+  schedule:
+    - cron: "@@CRON@@"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Ignore every record and run every job
+        type: boolean
+        default: false
+      task:
+        description: tests, the usual run; weekly, the independent check
+        type: choice
+        options: [tests, weekly]
+        default: tests
+      delete:
+        description: weekly only; the prune deletes the old records it would otherwise list
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      checks: read
+    concurrency:
+      group: ci-checks-${{ github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      ref_group: ${{ steps.plan.outputs.ref_group }}
+      main: ${{ steps.plan.outputs.main }}
+@@OUTPUTS@@
+    steps:
+      - name: Refuse a draft pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: |
+          echo "::error::This pull request is a draft, so no checks ran. Mark it ready for review to run them."
+          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Plan
+        id: plan
+        env:
+          CI_PLAN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_PLAN_EVENT: ${{ github.event_name }}
+          CI_PLAN_FORCE: ${{ inputs.force && 'true' || 'false' }}
+          CI_PLAN_TASK: ${{ inputs.task }}
+          CI_PLAN_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/kit/bin/plan
+      - name: The manifest lint
+        if: steps.plan.outputs.checks == 'run'
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ci/kit/bin/check-manifest --commit "$SHA"
+      - name: The workflow fence
+        if: steps.plan.outputs.checks == 'run'
+        run: python3 ci/kit/bin/check-workflow
+      - name: The escaping-read fence
+        if: steps.plan.outputs.checks == 'run'
+        run: python3 ci/kit/bin/check-escaping-reads
+      - name: Record this tree green
+        if: success() && steps.plan.outputs.checks == 'run'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KEY: ${{ steps.plan.outputs.checks_key }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ci/kit/bin/record checks "$KEY" "$SHA"

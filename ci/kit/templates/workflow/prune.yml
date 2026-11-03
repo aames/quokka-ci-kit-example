@@ -1,0 +1,31 @@
+
+  # The weekly prune of old records, on @@MAIN@@ only. On the schedule it is a
+  # dry run that lists what it would delete; a dispatch with task weekly and
+  # delete ticked deletes them.
+  prune:
+    name: prune
+    needs: checks
+    if: needs.checks.outputs.main == 'true' && (github.event_name == 'schedule' || inputs.task == 'weekly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.checks.outputs.sha }}
+      - name: Prune the green and local records older than the manifest's prune-days
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.checks.outputs.sha }}
+          DELETE: ${{ inputs.delete && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          bash ci/kit/bin/prune green "$SHA" "$DELETE"
+          bash ci/kit/bin/prune local "$SHA" "$DELETE"

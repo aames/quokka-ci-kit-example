@@ -157,7 +157,7 @@ fx_new() {
   printf 'readme\n' > "$FX/README.md"
   cp "$KITT_KIT/hooks/pre-push.shim" "$FX/.githooks/pre-push"
   chmod +x "$FX/.githooks/pre-push"
-  for f in bin lib hooks image tests; do cp -R "$KITT_KIT/$f" "$FX/ci/kit/$f"; done
+  for f in bin lib hooks image templates tests; do cp -R "$KITT_KIT/$f" "$FX/ci/kit/$f"; done
   git -C "$FX" add -A
   git -C "$FX" commit -qm kit
   fx_version

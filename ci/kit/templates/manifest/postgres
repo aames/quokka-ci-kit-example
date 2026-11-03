@@ -1,0 +1,1 @@
+service @@JOB@@ postgres image postgres:@@VERSION@@@sha256:@@DIGEST@@ url-env @@PROJECT_UPPER@@_TEST_PG_URL flag fsync=off flag synchronous_commit=off

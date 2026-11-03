@@ -23,7 +23,7 @@ here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 
-all_families="keys dump manifest green local plan extension record prune driver shape signpush hook workflow escaping prereq launcher reader twokeys update host flow"
+all_families="keys dump manifest green local plan extension record prune driver shape signpush hook workflow escaping prereq launcher reader twokeys update host flow init"
 want=""
 while [ "$#" -gt 0 ]; do
   case "$1" in

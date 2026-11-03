@@ -1,0 +1,4 @@
+@@@ decision
+      @@JOB@@: ${{ steps.plan.outputs.@@JOB@@ }}
+@@@ key
+      @@JOB@@_key: ${{ steps.plan.outputs.@@JOB@@_key }}
