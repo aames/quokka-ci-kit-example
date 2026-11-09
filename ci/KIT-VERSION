@@ -1,5 +1,5 @@
-tag v1.2.0-rc.1
-commit bdce37ab4f38f69f559f1e973089c8f02652619c
+tag v1.2.0
+commit e8c35512d0514cbedd8f0a12ca1a08a547e27fa6
 tree f9b648a78fb85390babef3559e3811b8776e3106
 signer aames
 vendored 2026-11-10
