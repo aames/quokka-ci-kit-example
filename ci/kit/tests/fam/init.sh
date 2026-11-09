@@ -597,7 +597,7 @@ exec(compile(open(os.environ["KI_SRC"]).read(), "kit-init", "exec"))' ) > "$work
   eq "AC-KI-18: it writes only the two files" "?? AGENTS.md
 ?? CLAUDE.md" "$(git -C "$IR" status --porcelain)"
   eq "AC-KI-18: and commits nothing" "$before" "$(git -C "$IR" rev-parse HEAD)"
-  has "AC-KI-18: the values came from the committed manifest: its adapter" "$IR/AGENTS.md" "\`ci/ci-job.sh\` is each job's one verdict script"
+  has "AC-KI-18: the values came from the committed manifest: its adapter" "$IR/AGENTS.md" "\`ci/ci-job.sh\` is the one test script"
   has "AC-KI-18: its check command" "$IR/CLAUDE.md" "Run \`make check\` before you push."
   hasnt "AC-KI-18: no token is left" "$IR/AGENTS.md" "@@"
 
