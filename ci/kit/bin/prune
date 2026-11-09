@@ -11,7 +11,8 @@
 # for `green`, the jobs `prune-keep-green` names; for `local`, the `local`
 # jobs. The keys and the lists are those of <main tip>'s own ci/manifest. A
 # green record's age is its commit's committer date; a local record's is its
-# tag's tagger date. A ref with no date of its kind (a local ref naming a
+# tag's tagger date; a green record that is a tag object (v1.2.0 and later)
+# is aged by the commit it names. A ref with no date of its kind (a local ref naming a
 # commit, not a tag) is kept and named; the plan never trusts it.
 #
 # The third word is DELETE: `false` is a DRY RUN, printing every decision and
@@ -42,7 +43,10 @@ fail() { echo "::error::$*" >&2; exit 1; }
 [ "$#" -eq 3 ] || usage
 class="$1" tip="$2" delete="$3"
 case "$class" in
-  green) date='%(committerdate:unix)' ;;
+  # A green record is a commit (before v1.2.0) or a tag object of one; its age
+  # is its commit's committer date either way, read through the tag (the `*`
+  # form) when the ref names a tag object; exactly one of the two is set.
+  green) date='%(committerdate:unix)%(*committerdate:unix)' ;;
   local) date='%(taggerdate:unix)' ;;
   *) usage ;;
 esac

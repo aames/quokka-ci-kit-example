@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
-# THE curl SHIM for K-record: answers the record writer's POST with the next
-# code of $CURL_CODES (space separated; 000 is a refused connection), the
-# body of the same position of $CURL_BODIES (| separated). Logs each call.
+# THE curl SHIM for K-record: answers the record writer's POSTs in order with
+# the next code of $CURL_CODES (space separated; 000 is a refused connection;
+# past the last, the last again) and the body of the same position of
+# $CURL_BODIES (| separated; past the last, the first). A body of `TAG` is
+# GitHub's answer to a tag object of the request's own `object`, its sha
+# $CURL_TAG_SHA. Logs each call as one line, `post <url path> <data>`.
 PATH="$SYS_PATH"
-out="" fmt=""
+out="" fmt="" url="" data=""
 while [ "$#" -gt 0 ]; do
-  case "$1" in -o) out="$2"; shift 2 ;; -w) fmt="$2"; shift 2 ;; *) shift ;; esac
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) fmt="$2"; shift 2 ;;
+    -d) data="$2"; shift 2 ;;
+    -X | -H) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
 done
-printf 'post\n' >> "$CURL_LOG"
+printf 'post %s %s\n' "${url#*/repos/}" "$data" >> "$CURL_LOG"
 n="$(wc -l < "$CURL_LOG" | tr -d ' ')"
 # shellcheck disable=SC2086
 set -- $CURL_CODES; code="${!n:-${!#}}"
 IFS='|' read -r -a bodies <<< "${CURL_BODIES:-}"
 body="${bodies[$((n - 1))]:-${bodies[0]:-}}"
+if [ "$body" = TAG ]; then
+  object="$(python3 -I -c 'import json, sys; print(json.loads(sys.argv[1]).get("object", ""))' "$data" 2> /dev/null)"
+  body="{\"node_id\":\"T\",\"tag\":\"x\",\"sha\":\"${CURL_TAG_SHA:-}\",\"message\":\"m {\\\"sha\\\":\\\"0\\\"}\",\"tagger\":{\"name\":\"github-actions[bot]\",\"date\":\"2026-11-09T00:00:00Z\"},\"object\":{\"sha\":\"${object}\",\"type\":\"commit\",\"url\":\"u\"},\"verification\":{\"verified\":false,\"reason\":\"unsigned\",\"signature\":null,\"payload\":null}}"
+fi
 [ "$code" != 000 ] || exit 7
 [ -z "$out" ] || printf '%s' "$body" > "$out"
 [ -z "$fmt" ] || printf '%s' "$code"

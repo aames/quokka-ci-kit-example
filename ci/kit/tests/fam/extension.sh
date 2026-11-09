@@ -15,8 +15,8 @@ kit_summary_row extra - "a further row" - run'
   rc_is "an extension that adds a job's decision passes" 0 "$PLAN_RC"
   has "its decision is an output" "$work/out" "extra=run"
   has "its output is written" "$work/out" "stacks=one two"
-  has "its row is in the summary" "$work/summary" "| extra | - | added by the extension | - | **run** |"
-  has "its further row is too" "$work/summary" "| extra | - | a further row | - | **run** |"
+  has "its row is in the summary" "$work/summary" "| extra | - | added by the extension | - | - | **run** |"
+  has "its further row is too" "$work/summary" "| extra | - | a further row | - | - | **run** |"
   ext_run 'KIT_DECISION[alpha]=off'
   rc_is "an extension that sets a kit job's decision directly" 1 "$PLAN_RC"
   has "fails red with the sentence" "$work/stdout" "::error::The plan extension changed the decision of alpha, which is the kit's to make, so nothing ran."
@@ -26,6 +26,13 @@ kit_summary_row extra - "a further row" - run'
   ext_run 'kit_output alpha_key x'
   rc_is "an extension writing a kit output name" 1 "$PLAN_RC"
   has "is refused as the kit's" "$work/stdout" "the plan extension wrote the output alpha_key, which is the kit's, so nothing ran."
+  ext_run 'kit_output alpha_platform linux/arm64'
+  rc_is "an extension writing a kit platform output" 1 "$PLAN_RC"
+  has "is refused as the kit's" "$work/stdout" "the plan extension wrote the output alpha_platform, which is the kit's, so nothing ran."
+  ext_run 'platform[alpha]=linux/riscv64'
+  rc_is "an extension changing the plan's own platform[alpha]" 0 "$PLAN_RC"
+  has "the platform output is still the snapshot's" "$work/out" "alpha_platform="
+  hasnt "and never the changed one" "$work/out" "riscv64"
   ext_run 'kit_decide Bad_Name run x'
   rc_is "an extension deciding a job named out of shape" 1 "$PLAN_RC"
   # the snapshot holds keys too, and a kit job's outputs come from it (the security review, SECURITY.md)

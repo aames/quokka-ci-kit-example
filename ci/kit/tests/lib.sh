@@ -234,6 +234,24 @@ lfacts() {
   if [ -n "${2:-}" ]; then sed -e "$2" "$1" > "$1.e" && mv "$1.e" "$1"; fi
 }
 
+# gfacts <file> <job> [sed expression]: a green record's facts block for <job>
+# at HEAD (the record writer's shape), edited.
+gfacts() {
+  { printf 'kitfix-green v1\njob %s\nkey %s\ncommit %s\nplatform linux/amd64\nhost linux/amd64\nimage sha256:%s\nrun 4242\nworkflow_ref fixture/repo/.github/workflows/ci.yml@refs/heads/main\n' \
+      "$2" "$(fx_key "$2")" "$(git -C "$FX" rev-parse HEAD)" "$(printf 'ab%.0s' $(seq 1 32))"; } > "$1"
+  if [ -n "${3:-}" ]; then sed -e "$3" "$1" > "$1.e" && mv "$1.e" "$1"; fi
+}
+# grec <job> <key> <facts file> [<repo>]: an UNSIGNED tag object of that facts
+# block naming <repo>'s HEAD (default the fixture clone), as the record writer
+# makes one through the API, at refs/ci/green/<job>/<key> there; prints the object.
+grec() {
+  local r="${4:-$FX}" obj
+  obj="$({ printf 'object %s\ntype commit\ntag ci/green/%s/%s\ntagger github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> 1762646400 +0000\n\n' \
+      "$(git -C "$r" rev-parse HEAD)" "$1" "$2"; cat "$3"; } | git -C "$r" mktag)"
+  git -C "$r" update-ref "refs/ci/green/$1/$2" "$obj"
+  echo "$obj"
+}
+
 # plan_run <VAR=value>...: the real plan under bash 4.2 or later in $FX at its
 # HEAD, on a git that logs its calls and the gh shim; sets PLAN_RC and leaves
 # $work/out (the outputs), $work/summary and $work/stdout.
@@ -249,7 +267,7 @@ plan_run() {
       GITHUB_OUTPUT="$work/out" GITHUB_STEP_SUMMARY="$work/summary" "$@" "$BASH4" "$KITT_KIT/bin/plan" ) > "$work/stdout" 2>&1 || PLAN_RC=$?
 }
 # decisions: the kit's per-job decisions from the last plan, on one line.
-decisions() { grep -vE '_key=|^main=|^ref_group=' "$work/out" | tr '\n' ' ' | sed 's/ $//'; }
+decisions() { grep -vE '_key=|_platform=|^main=|^ref_group=' "$work/out" | tr '\n' ' ' | sed 's/ $//'; }
 out_of() { grep "^$1=" "$work/out" | head -1 | cut -d= -f2-; }
 
 # drv <local-ci args...>: the driver on the farm in $FX; DRV_RC and $work/drv.out.

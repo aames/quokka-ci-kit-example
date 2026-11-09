@@ -5,6 +5,7 @@
 # $TOOLS; and for a job container does what cikit-enter does (the archive from
 # stdin, only the -e names it was given) and runs the fixture's adapter.
 # Switches: SHIM_DOCKER_INFO_RC, SHIM_CONTAINER_OS, SHIM_CONTAINER_ARCH,
+# SHIM_UNAME_FAIL (the uname container fails),
 # SHIM_HANG (the job container waits on a marker, for the SIGINT case).
 printf '%s\n' "$*" >> "$DOCKER_LOG"
 PATH="$SYS_PATH"
@@ -59,6 +60,7 @@ args=("$@")
 n="${#args[@]}"
 for a in "${args[@]}"; do case "$a" in -d) echo fixture-sidecar-id; exit 0 ;; esac; done
 if [ "$n" -ge 3 ] && [ "${args[$((n - 3))]} ${args[$((n - 2))]} ${args[$((n - 1))]}" = 'uname -s -m' ]; then
+  [ -z "${SHIM_UNAME_FAIL:-}" ] || exit 1
   echo "${SHIM_CONTAINER_OS:-Linux} ${SHIM_CONTAINER_ARCH:-aarch64}"; exit 0
 fi
 for i in "${!args[@]}"; do

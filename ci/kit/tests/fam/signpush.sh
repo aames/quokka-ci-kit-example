@@ -14,6 +14,7 @@ fam_signpush() {
   drv sign --commit HEAD alpha
   rc_is "sign after a passing run" 0 "$DRV_RC"
   obj="$(git -C "$FX" rev-parse "refs/ci/local/alpha/$key")"
+  has "the sign line names the tag object, the commit and the platform" "$work/drv.out" "alpha: signed refs/ci/local/alpha/$key (tag object ${obj:0:12}, commit $(git -C "$FX" rev-parse HEAD | cut -c1-8), linux/arm64)."
   eq "the ref is a tag object" tag "$(git -C "$FX" cat-file -t "$obj")"
   eq "whose object is the commit tested" "$(git -C "$FX" rev-parse HEAD)" "$(git -C "$FX" cat-file tag "$obj" | awk '$1=="object"{print $2;exit}')"
   git -C "$FX" cat-file tag "$obj" > "$work/raw"
@@ -36,7 +37,7 @@ fam_signpush() {
   mkdir -p "$FX/hooks2"; printf '#!/bin/sh\ntouch "%s/hook-ran"\n' "$work" > "$FX/hooks2/pre-push"; chmod +x "$FX/hooks2/pre-push"
   git -C "$FX" config core.hooksPath hooks2
   drv push --commit HEAD alpha
-  rc_is "push" 0 "$DRV_RC"; has "pushes the record" "$work/drv.out" "alpha: pushed refs/ci/local/alpha/$key to origin."
+  rc_is "push" 0 "$DRV_RC"; has "pushes the record, naming its platform" "$work/drv.out" "alpha: pushed refs/ci/local/alpha/$key to origin (linux/arm64)."
   check "the push went with --no-verify (the repository's hook did not run)" test ! -e "$work/hook-ran"
   check "the origin holds the record" test -n "$(git -C "$FX" ls-remote origin "refs/ci/local/alpha/$key")"
   drv push --commit HEAD alpha
