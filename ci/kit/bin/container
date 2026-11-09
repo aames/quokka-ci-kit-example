@@ -62,6 +62,16 @@
 # container, the sidecar with its anonymous volume, the network and this
 # script's temporary files on every exit, SIGINT included.
 #
+# THE RAN FILE (DESIGN.md 5.2, 6.5). After a verdict that exited 0, run reads
+# `uname -s -m` in a throwaway container of the image the job ran in (no
+# network, the hardening) and writes <common dir>/<project>-ci/ran/<job>/<key>,
+# two lines: `platform <os/arch>` (by the sibling library's kit_platform_of)
+# and `image <the image id>`. The record writer reads it, so a CI record's
+# platform is the job image's and never the runner's. Any earlier file for
+# the key is removed before the job starts, so a failed run leaves none; a
+# pass whose platform cannot be read exits 2, so a run that exits 0 has
+# always written the file.
+#
 # versions: the reader, run once in one container with no network, prints
 # `<tool> <version>` per pinned tool of the named jobs. The reader is TEXT
 # held here (a bash loop and one awk program); the `probe` lines are passed
@@ -131,6 +141,8 @@ case "$cmd" in
   *) usage ;;
 esac
 
+self="${BASH_SOURCE[0]}"
+case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
 sha="$(git rev-parse --verify -q "${rev}^{commit}")" || refuse "${rev} is not a commit here, so nothing ran."
 git cat-file -e "${sha}:ci/kit/lib/keys.sh" 2> /dev/null || refuse "${sha:0:8} predates the kit, so nothing ran."
 
@@ -542,7 +554,7 @@ cmd_versions() {
 # --- run ---------------------------------------------------------------------------------
 
 cmd_run() {
-  local job="${jobs[0]}" tree input shallow gid i kind vol target var url rc
+  local job="${jobs[0]}" tree input shallow gid i kind vol target var url rc key ran out os arch platform
   local flags=() envs=() caches=() svc=() history=false socket=false install
   if [ -z "$run_id" ]; then
     if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_JOB:-}" ]; then
@@ -565,6 +577,11 @@ cmd_run() {
   fi
   ready_for "$job"
   tree="$(git rev-parse --verify -q "${sha}^{tree}")" || refuse "${sha:0:8} has no tree, so ${job} did not run."
+  key="$(keys_call kit_key "$sha" "$job")" || key=""
+  [[ "$key" =~ $RE_KEY ]] || refuse "The ${job} key for ${sha:0:8} could not be computed, so ${job} did not run."
+  ran="$(git rev-parse --path-format=absolute --git-common-dir)" || refuse "This clone's git directory could not be read, so ${job} did not run."
+  ran="${ran}/${project}-ci/ran/${job}/${key}"
+  rm -f -- "$ran"
   temp_file
   input="$made"
   if [ "$history" = true ]; then
@@ -654,7 +671,19 @@ cmd_run() {
     say "${job} failed (exit ${i}). The last ${CI_SERVICE_LOG_LINES} lines of ${svc_container}'s log follow."
     docker logs --tail "$CI_SERVICE_LOG_LINES" "$svc_container" >&2 || true
   fi
-  return "$i"
+  [ "$i" -eq 0 ] || return "$i"
+  # The platform the verdict ran on, read inside the image it ran in.
+  out="$(docker run --rm --network none "${HARDEN[@]}" --user "${user}:${user}" "$run_tag" uname -s -m 2> /dev/null)" || out=""
+  read -r os arch <<< "$out" || true
+  # shellcheck disable=SC2016
+  platform="$("$BASH" -c '. "$1"; kit_platform_of "$2" "$3"' _ "${here}/../lib/keys.sh" "${os:-}" "${arch:-}" 2> /dev/null)" || platform=""
+  if [ -z "${os:-}" ] || [ -z "${arch:-}" ] || [ -z "$platform" ]; then
+    refuse "${job} passed, but its image did not say its platform, so no record can be written for it."
+  fi
+  mkdir -p "${ran%/*}" || refuse "${job} passed, but ${ran%/*} could not be made, so no record can be written for it."
+  printf 'platform %s\nimage %s\n' "$platform" "$run_image" > "$ran" \
+    || refuse "${job} passed, but ${ran} could not be written, so no record can be written for it."
+  return 0
 }
 
 # service_start <job>: the job's sidecar on a network of its own, published

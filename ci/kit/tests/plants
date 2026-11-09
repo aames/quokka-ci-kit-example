@@ -73,12 +73,18 @@ for n in range(2, 13):
     if n in (11,) or True:
         plant("manifest-rule-%d" % n, "manifest", "bin/check-manifest", lint_rule(n), "lint rule %d removed" % n)
 plant("green-slug", "green", "lib/keys.sh", once('select(.conclusion == "success" and .app.slug == "github-actions")', 'select(.conclusion == "success")'), "the app-slug filter removed")
+plant("green-peel", "green", "lib/keys.sh", once('gh api "repos/${repo}/commits/${commit}/check-runs', 'gh api "repos/${repo}/commits/${sha}/check-runs'), "the check run looked up on the tag object, not its commit")
+plant("green-facts", "green", "lib/keys.sh", once('kit__green_facts "$sha" "$job" "$key" "$commit" || return 3', ':'), "a tag-object record's facts not checked")
+plant("plan-facts-commit", "plan", "lib/keys.sh", once('|| [ "$(kit__local_fact "$facts" commit)" != "$commit" ]; then\n    KIT_RECORD_REASON=', '; then\n    KIT_RECORD_REASON='), "a green record's facts' commit not compared")
+plant("plan-green-linux", "plan", "lib/keys.sh", once('      linux/amd64 | linux/arm64) ;;\n      "") KIT_RECORD_REASON', '      */*) ;;\n      "") KIT_RECORD_REASON'), "a local job's green record admitted on any platform")
 plant("local-verify", "local", "lib/keys.sh", once('if ! ssh-keygen -Y verify -f "$dir/signers" -I "$principal" -n git -s "$dir/sig" < "$dir/payload" > /dev/null 2>&1; then', 'if false; then'), "the -Y verify call removed")
 plant("local-signers", "local", "lib/keys.sh", once('git -C "$repo" show "${main}:${signers}"', 'git -C "$repo" show "${obj}^{commit}:${signers}"'), "main's signers replaced by the checkout's")
 plant("plan-schedule", "plan", "bin/plan", once('if [ "$CI_PLAN_EVENT" = schedule ]; then\n  CI_PLAN_TASK=weekly\nfi', ':'), "the schedule arm removed")
 plant("plan-prefix", "plan", "bin/plan", once('ref_group="weekly-${ref_group}"', 'ref_group="${ref_group}"'), "the weekly- prefix removed")
 plant("extension-snapshot", "extension", "bin/plan", once('[ "${KIT_DECISION[$job]-}" = "${kit_snap_decision[$job]}" ] || kit__ext_refuse "$job"', ':'), "the snapshot comparison removed")
 plant("record-422", "record", "bin/record", once("if grep -q 'Reference already exists' \"$body\"; then", "if true; then"), "the 422 text check removed")
+plant("record-ran", "record", "bin/record", once('if ! [ -f "$ran" ]; then', 'if false; then'), "the ran file's presence check removed")
+plant("record-ref-at-commit", "record", "bin/record", once('"{\\"ref\\":\\"${ref}\\",\\"sha\\":\\"${tag}\\"}"', '"{\\"ref\\":\\"${ref}\\",\\"sha\\":\\"${sha}\\"}"'), "the ref pointed at the commit, not the tag object")
 plant("prune-tip", "prune", "bin/prune", once('for k in ${keep[@]+"${keep[@]}"}; do [ "$k" != "$ref" ] || continue 2; done', ':'), "the tip exception removed")
 plant("driver-trap", "driver", "bin/container", once('trap cleanup EXIT', ':'), "the cleanup trap removed")
 plant("driver-rename", "driver", "bin/local-ci", once('if mv "$lock" "$aside" 2> /dev/null; then', 'if printf \'%s\\n\' "$$" > "${lock}/pid"; then'), "the stale-lock rename replaced by a pid write")
@@ -123,6 +129,7 @@ plant("manifest-socket-install", "manifest", "bin/check-manifest", once('has_wor
 plant("manifest-socket-service", "manifest", "bin/check-manifest", once('has_word "${W[1]}" "$socketed" && finding "$LINE" "service names', 'false && finding "$LINE" "service names'), "the service-on-a-socket-job clause removed")
 plant("keys-facts-names", "manifest", "lib/keys.sh", once('split("job key commit started duration_s platform host docker image not_run log_sha256", a, " ")', 'split("", a, " ")'), "the facts-name list emptied")
 plant("plan-outputs-live", "extension", "bin/plan", once("printf '%s=%s\\n' \"$job\" \"${kit_snap_decision[$job]}\"", "printf '%s=%s\\n' \"$job\" \"${decision[$job]}\""), "the kit jobs' outputs written from the live arrays")
+plant("plan-platform-live", "extension", "bin/plan", once('value="${kit_snap_platform[$job]}"', 'value="${platform[$job]}"'), "the platform outputs written from the live array")
 plant("plan-key-check", "extension", "bin/plan", once('      || kit__ext_refuse_key "$job"', '      || :'), "the key comparison removed")
 plant("manifest-always-on", "manifest", "bin/check-manifest", once('    || finding "$(line_of paths "$KIT_ALWAYS_ON")" "the key of the always-on job', '    || : "$(line_of paths "$KIT_ALWAYS_ON")" "the key of the always-on job'), "rule 3's always-on clause removed")
 plant("manifest-copy-from", "manifest", "bin/check-manifest", once('finding0 "${KIT_IMAGE} line ${at}: COPY --from=', ': "${KIT_IMAGE} line ${at}: COPY --from='), "the COPY --from= clause removed")
@@ -159,6 +166,18 @@ plant("init-python-path", "IMAGE:initpy", "templates/image/python.Dockerfile", o
 # the security read KI-s (kit-init 3c), findings 1 and 2
 plant("init-symlink-targets", "init", "bin/kit-init", once('    out, seen = [], set()\n    root = os.path.realpath(top)\n', '    return []\n    out, seen = [], set()\n    root = os.path.realpath(top)\n'), "the refusal of a target that is a symbolic link or outside the top removed (KI-s finding 1)")
 plant("init-bounded-values", "init", "bin/kit-init", once('    if value == ".":\n        return True\n    if BOUNDED_RE', '    return True\n    if BOUNDED_RE'), "the bound on directory and file names removed (KI-s finding 2)")
+
+# ARCH-1's review (docs/reviews/arch-1-ratification-2026-11-09.md section 5, F-3, F-4, F-8): the green arm's
+# refusals no plant reached, the one platform shape, the empty word, the launcher's ran-file removal, prune's tag age
+plant("green-tag-of-tag", "green", "lib/keys.sh", once("KIT_RECORD_REASON='it is a tag that does not point at a commit'; return 1", ":"), "a tag that does not point at a commit no longer refused")
+plant("green-local-no-platform", "green", "lib/keys.sh", once("""      "") KIT_RECORD_REASON='it records no platform'; return 1 ;;""", """      "") ;;"""), "a local job's green record admitted with no platform")
+plant("green-platform-once", "green", "lib/keys.sh", once("END { if (c != 1) exit 1; print v }", "END { if (c < 1) exit 1; print v }"), "a facts line given twice read as its last value")
+plant("green-other-no-platform", "green", "lib/keys.sh", once("""  elif [ -z "$value" ]; then\n    KIT_RECORD_REASON='it records no platform'; return 1\n  elif""", "  elif"), "an absent platform named as one out of shape")
+plant("green-shape-old", "green", "lib/keys.sh", once("KIT_PLATFORM_SHAPE='^[a-z0-9][a-z0-9._-]*/[a-z0-9_]+$'", "KIT_PLATFORM_SHAPE='^[a-z0-9]+/[a-z0-9_]+$'"), "the platform shape before F-3, refusing a system word with - or .")
+plant("record-shape-old", "record", "lib/keys.sh", once("KIT_PLATFORM_SHAPE='^[a-z0-9][a-z0-9._-]*/[a-z0-9_]+$'", "KIT_PLATFORM_SHAPE='^[a-z0-9]+/[a-z0-9_]+$'"), "the same, seen by the ran file's check")
+plant("keys-platform-empty", "keys", "lib/keys.sh", once('  [ -n "$os" ] && [ -n "$arch" ] || return 1\n', ""), "kit_platform_of's refusal of an empty word removed")
+plant("launcher-ran-rm", "launcher", "bin/container", once('  rm -f -- "$ran"\n', "  :\n"), "an earlier ran file no longer removed before the job")
+plant("prune-tag-date", "prune", "bin/prune", once("date='%(committerdate:unix)%(*committerdate:unix)'", "date='%(committerdate:unix)'"), "a green tag object no longer aged by its commit")
 
 def main(argv):
     only, bash, listing = [], os.environ.get("BASH") or "/bin/bash", False

@@ -153,4 +153,14 @@ rc=2" "$out"
   eq "kit_pin_at: the toolchain-line, first-line and readonly-version kinds, read as data" "go1.27.3 v24.1.0 v0.11.0 3.14" \
     "$(KIT_KEYS_REPO="$FX" "$BASH" -c ". '$KITT_KIT/lib/keys.sh'; echo \$(kit_pin_at HEAD go) \$(kit_pin_at HEAD node) \$(kit_pin_at HEAD shellcheck) \$(kit_pin_at HEAD python)")"
   eq "kit_escaping_reads: the entries as written" "3" "$(KIT_KEYS_REPO="$FX" "$BASH" -c ". '$KITT_KIT/lib/keys.sh'; kit_manifest_load HEAD; kit_escaping_reads | wc -l | tr -d ' '")"
+  eq "kit_platform_of: the system lower-cased, x86_64 as amd64, aarch64 as arm64, under this bash" "linux/amd64 linux/arm64 darwin/arm64 freebsd/riscv64" \
+    "$("$BASH" -c ". '$KITT_KIT/lib/keys.sh'; echo \$(kit_platform_of Linux x86_64) \$(kit_platform_of Linux aarch64) \$(kit_platform_of Darwin arm64) \$(kit_platform_of FreeBSD riscv64)")"
+  # the one shape (KIT_PLATFORM_SHAPE): every string kit_platform_of writes, Git Bash's and Cygwin's unames among them
+  eq "kit_platform_of: Git Bash's, MSYS2's, Cygwin's and OpenBSD's unames" "mingw64_nt-10.0-19045/amd64 msys_nt-10.0-19045/amd64 cygwin_nt-10.0/amd64 openbsd/amd64" \
+    "$("$BASH" -c ". '$KITT_KIT/lib/keys.sh'; echo \$(kit_platform_of MINGW64_NT-10.0-19045 x86_64) \$(kit_platform_of MSYS_NT-10.0-19045 x86_64) \$(kit_platform_of CYGWIN_NT-10.0 x86_64) \$(kit_platform_of OpenBSD amd64)")"
+  eq "KIT_PLATFORM_SHAPE accepts what kit_platform_of writes and refuses the rest, under this bash" "linux/amd64:y darwin/arm64:y msys_nt-10.0-19045/amd64:y mingw64_nt-10.0-19045/amd64:y cygwin_nt-10.0/amd64:y openbsd/amd64:y Linux/amd64:n linux_amd64:n /amd64:n linux/:n -linux/amd64:n linux/amd64/x:n" \
+    "$("$BASH" -c ". '$KITT_KIT/lib/keys.sh'; for p in linux/amd64 darwin/arm64 msys_nt-10.0-19045/amd64 mingw64_nt-10.0-19045/amd64 cygwin_nt-10.0/amd64 openbsd/amd64 Linux/amd64 linux_amd64 /amd64 linux/ -linux/amd64 linux/amd64/x; do if [[ \$p =~ \$KIT_PLATFORM_SHAPE ]]; then printf '%s:y ' \$p; else printf '%s:n ' \$p; fi; done" | sed 's/ $//')"
+  # an empty word is refused: status 1 and nothing printed, so no caller can write `platform /`
+  eq "kit_platform_of refuses an empty system, an empty architecture and both" "1[] 1[] 1[] 0[linux/amd64]" \
+    "$("$BASH" -c ". '$KITT_KIT/lib/keys.sh'; for a in ':x86_64' 'Linux:' ':' 'Linux:x86_64'; do o=\$(kit_platform_of \"\${a%%:*}\" \"\${a#*:}\") && r=0 || r=\$?; printf '%s[%s] ' \$r \"\$o\"; done" | sed 's/ $//')"
 }

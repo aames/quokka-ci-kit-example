@@ -7,20 +7,35 @@
 #
 #   ci/kit/bin/record <job> <key> <sha>
 #
-# Creates the lightweight ref refs/ci/green/<job>/<key> pointing at <sha>
-# through POST /repos/{owner}/{repo}/git/refs. A 422 "Reference already exists"
-# is success: another branch proved the same tree first, and either commit will
-# do. Anything else fails the step, because a record that silently did not land
-# is a re-run nobody asked for, and a step that says it wrote one when it did
-# not is worse.
+# Writes the record in two requests. First a TAG OBJECT through POST
+# /repos/{owner}/{repo}/git/tags (type commit, object <sha>, tag name
+# ci/green/<job>/<key>, message the FACTS BLOCK below), then the ref
+# refs/ci/green/<job>/<key> at the tag object through POST .../git/refs. The
+# tag is unsigned (the job token cannot sign); a record is trusted by the
+# check run on its commit, as before (DESIGN.md 5.4). A 422 "Reference already
+# exists" on the ref is success: another branch proved the same tree first,
+# and either record will do. Anything else fails the step, because a record
+# that silently did not land is a re-run nobody asked for, and a step that
+# says it wrote one when it did not is worse.
 #
-# EXCEPT A 403, WHICH WARNS. In the reference build two of about fifteen
-# writes were refused with 403 after the job's tests had passed, one
-# coinciding to the second with a newer push starting the same job (GitHub
-# cancels the older job and revokes its token mid-write). A 403 is retried
-# once after five seconds; refused again, the step prints a warning naming
-# the record and exits 0. Nothing untested becomes green by it: a missing
-# record only means the next run re-tests that tree.
+# THE FACTS BLOCK, one `name value` line each, the format line first:
+#   <project>-green v1
+#   job, key, commit   the three arguments
+#   platform           where the verdict ran: for a `local` job, the job
+#                      image's, read from the ran file the launcher wrote
+#                      after the verdict (<common dir>/<project>-ci/ran/<job>/
+#                      <key>: `platform <os/arch>`, `image <id>`); for any
+#                      other job, whose verdict runs on the runner itself,
+#                      this runner's
+#   host               this runner's platform
+#   image              the ran file's image id, or `none` for a job the
+#                      launcher does not run
+#   run, workflow_ref  GITHUB_RUN_ID and GITHUB_WORKFLOW_REF (`unknown` when
+#                      unset)
+# Every platform is kit_platform_of's string. A `local` job with no ran file,
+# or one that is not those two lines with a platform of the library's
+# KIT_PLATFORM_SHAPE, is refused with exit 2 before any request: a record must not be written without its platform, and one whose
+# platform came from the runner would say something false.
 #
 # Shapes are refused with exit 2 before any request: a wrong argument count,
 # a job the recorded commit's ci/manifest does not declare, a key that is not
@@ -53,40 +68,114 @@ api="${GITHUB_API_URL:-https://api.github.com}"
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::\"${key}\" is not a key"; exit 2; }
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::\"${sha}\" is not a commit sha"; exit 2; }
 # The job must be a `job` line of the recorded commit's own ci/manifest, read
-# by the library's one parser in a child shell.
-declared="$(bash -c '. "$1" && kit_manifest_load "$2" && printf "%s\n" "${KIT_JOBS[@]}"' \
+# by the library's one parser in a child shell: the project word first, then
+# `<job> <class>` per job.
+declared="$(bash -c '. "$1" && kit_manifest_load "$2" && printf "%s\n" "$KIT_PROJECT" && for i in "${!KIT_JOBS[@]}"; do printf "%s %s\n" "${KIT_JOBS[$i]}" "${KIT_JOB_CLASS[$i]}"; done' \
   _ "$here/../lib/keys.sh" "$sha" 2>/dev/null)" || declared=""
-if ! grep -qxF -- "$job" <<< "$declared"; then
+project="$(head -n 1 <<< "$declared")"
+class="$(awk -v j="$job" 'NR > 1 && $1 == j { print $2; exit }' <<< "$declared")"
+if [ -z "$class" ]; then
   echo "::error::no green record exists for job ${job}"
   exit 2
 fi
+platform_of() { bash -c '. "$1" && kit_platform_of "$2" "$3"' _ "$here/../lib/keys.sh" "$1" "$2"; }
+# The one shape of a platform string, the library's KIT_PLATFORM_SHAPE.
+platform_shape="$(bash -c '. "$1" && printf "%s" "$KIT_PLATFORM_SHAPE"' _ "$here/../lib/keys.sh" 2>/dev/null)" || platform_shape=""
+if [ -z "$platform_shape" ]; then
+  echo "::error::the platform shape could not be read from ${here}/../lib/keys.sh, so no record was written."
+  exit 2
+fi
+one_word() { # one_word <value>: the value when it is one word, else `unknown`
+  if [[ "${1:-}" =~ ^[^[:space:]]+$ ]]; then printf '%s' "$1"; else printf unknown; fi
+}
+host="$(platform_of "$(uname -s)" "$(uname -m)")" || host=""
+if [ -z "$host" ]; then
+  echo "::error::this runner did not say its platform, so no record was written."
+  exit 2
+fi
+
+# Where the verdict ran. A `local` job ran in its image, and the launcher said
+# where in the ran file; any other job ran here.
+if [ "$class" = local ]; then
+  ran="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/${project}-ci/ran/${job}/${key}"
+  if ! [ -f "$ran" ]; then
+    echo "::error::${job} has no ran file at ${ran}, so no record was written: a record names the platform its verdict ran on, and only the launcher's run of ${job} says it."
+    exit 2
+  fi
+  ran_text="$(cat "$ran")"
+  ran_shape="^platform ([^[:space:]]+)"$'\n'"image (sha256:[0-9a-f]{64})\$"
+  if ! [[ "$ran_text" =~ $ran_shape ]]; then
+    echo "::error::the ran file ${ran} is not the two lines platform and image, so no record was written."
+    exit 2
+  fi
+  platform="${BASH_REMATCH[1]}" image="${BASH_REMATCH[2]}"
+  if ! [[ "$platform" =~ $platform_shape ]]; then
+    echo "::error::the ran file ${ran} records the platform ${platform}, which is not of the shape <os>/<arch>, so no record was written."
+    exit 2
+  fi
+else
+  platform="$host" image=none
+fi
+facts="${project}-green v1
+job ${job}
+key ${key}
+commit ${sha}
+platform ${platform}
+host ${host}
+image ${image}
+run $(one_word "${GITHUB_RUN_ID:-}")
+workflow_ref $(one_word "${GITHUB_WORKFLOW_REF:-}")
+"
 
 ref="refs/ci/green/${job}/${key}"
 body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
-post() { # post: prints the HTTP status, 000 when the API cannot be reached
-  local code
-  code="$(curl -sS -o "$body" -w '%{http_code}' -X POST \
+status=""
+post() { # post <path> <json>: sets status to the HTTP status, 000 when the API cannot be reached
+  status="$(curl -sS -o "$body" -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "${api}/repos/${GITHUB_REPOSITORY}/git/refs" \
-    -d "{\"ref\":\"${ref}\",\"sha\":\"${sha}\"}")" || code=000
-  printf '%s' "$code"
+    "${api}/repos/${GITHUB_REPOSITORY}/$1" \
+    -d "$2")" || status=000
 }
-status="$(post)"
-if [ "$status" = 403 ]; then
-  echo "writing ${ref} answered 403; retrying once in five seconds."
-  sleep 5
-  status="$(post)"
+# post_403 <path> <json> <what>: post, and on a 403 once more after five
+# seconds; refused again, warn and exit 0 (the tests passed; the next run
+# re-tests this tree).
+post_403() {
+  post "$1" "$2"
   if [ "$status" = 403 ]; then
-    echo "::warning::${ref} was not written: GitHub refused it twice with 403 ($(head -c 300 "$body")). The tests passed; the next run re-tests this tree."
-    exit 0
+    echo "writing $3 answered 403; retrying once in five seconds."
+    sleep 5
+    post "$1" "$2"
+    if [ "$status" = 403 ]; then
+      echo "::warning::${ref} was not written: GitHub refused it twice with 403 ($(head -c 300 "$body")). The tests passed; the next run re-tests this tree."
+      exit 0
+    fi
   fi
+}
+
+# 1. The tag object. Its JSON is written and read by python3's own json, the
+#    runner's python3 the fences already need.
+json="$(python3 -I -c 'import json, sys; print(json.dumps({"tag": sys.argv[1], "message": sys.argv[2], "object": sys.argv[3], "type": "commit"}))' \
+  "ci/green/${job}/${key}" "$facts" "$sha")"
+post_403 git/tags "$json" "the tag object of ${ref}"
+if [ "$status" != 201 ]; then
+  echo "::error::writing the tag object of ${ref} answered ${status}: $(head -c 300 "$body")"
+  exit 1
+fi
+read -r tag target type < <(python3 -I -c 'import json, sys
+d = json.load(open(sys.argv[1])); o = d.get("object") or {}
+print(d.get("sha", "-"), o.get("sha", "-"), o.get("type", "-"))' "$body" 2>/dev/null || echo "- - -")
+if ! [[ "$tag" =~ ^[0-9a-f]{40}$ ]] || [ "$target" != "$sha" ] || [ "$type" != commit ]; then
+  echo "::error::GitHub's answer for the tag object of ${ref} does not name a tag of ${sha}, so no record was written: $(head -c 300 "$body")"
+  exit 1
 fi
 
+# 2. The ref, at the tag object.
+post_403 git/refs "{\"ref\":\"${ref}\",\"sha\":\"${tag}\"}" "$ref"
 case "$status" in
-  201) echo "recorded ${ref} -> ${sha}" ;;
+  201) echo "recorded ${ref} -> ${sha} (tag object ${tag:0:12}, ${platform})" ;;
   422)
     if grep -q 'Reference already exists' "$body"; then
       echo "${ref} already exists: this tree was proven green before, and that record stands."

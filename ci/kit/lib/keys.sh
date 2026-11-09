@@ -34,6 +34,7 @@
 # BASH 3.2. The functions the host reaches run under the macOS /bin/bash:
 #   kit_key  kit_keys  kit_key_paths  kit_pin_tools  kit_count_fields
 #   kit_pin_at  kit_manifest_load  kit_manifest_dump  kit_jobs  kit_env_reserved
+#   kit_platform_of
 # and call only these host tools: git, awk, cut, and sha256sum or
 # shasum -a 256. No declare -A, mapfile, readarray, case-changing expansions,
 # [[ -v ]], wait -n, negative subscripts or coproc anywhere in this file. The
@@ -67,6 +68,35 @@ kit_env_reserved() {
   done
   return 1
 }
+
+# --- THE PLATFORM STRING ---------------------------------------------------
+#
+# kit_platform_of <uname -s> <uname -m>: `<os>/<arch>`, the system
+# lower-cased, x86_64 read as amd64 and aarch64 as arm64 (DESIGN.md 6.5's
+# `platform` row). The ONE computer of the string: the driver, the launcher
+# and the record writer all call it, so a local record's platform and a CI
+# record's cannot be spelled two ways. An empty word is refused: status 1 and
+# nothing printed, so no caller can write `platform /`.
+kit_platform_of() {
+  local os="${1:-}" arch="${2:-}"
+  [ -n "$os" ] && [ -n "$arch" ] || return 1
+  case "$os" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) os="$(awk -v s="$os" 'BEGIN { print tolower(s) }')" ;;
+  esac
+  case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+  printf '%s/%s\n' "$os" "$arch"
+}
+
+# KIT_PLATFORM_SHAPE: the ONE shape of a platform string, every string
+# kit_platform_of writes on a host the kit admits: a lower-case system word,
+# which may carry `.`, `_` or `-` as Git Bash's and Cygwin's unames do
+# (`mingw64_nt-10.0-19045`, `cygwin_nt-10.0`), a `/`, and an architecture
+# word. Read by the plan's green arm for a job whose verdict ran on the
+# runner and by `record` for the launcher's ran file. A `local` job's green
+# record is held to linux/amd64 or linux/arm64 besides (kit__green_facts).
+KIT_PLATFORM_SHAPE='^[a-z0-9][a-z0-9._-]*/[a-z0-9_]+$'
 
 # --- THE PARSER -----------------------------------------------------------
 #
@@ -522,20 +552,87 @@ kit_pin_at() (
 # ref names, and the test is kit_local_record_trusted's six conditions.
 # Returns 0 trusted, 4 not; KIT_LOCAL_REASON and KIT_LOCAL_PRINCIPAL say why
 # and who.
+#
+# THE CI ARM (DESIGN.md 5.4) takes both shapes of green record: <sha> is a
+# commit (a lightweight record, written before v1.2.0) or a tag object of one
+# (its message the facts block, DESIGN.md 5.2). Either is peeled to its
+# commit, the key is recomputed on the commit and the check run is looked up
+# on the commit. A tag object's facts must also agree (kit__green_facts),
+# else 3 with KIT_RECORD_REASON one clause for the plan's sentence.
+#
+# KIT_RECORD_PLATFORM: on a trusted record, the platform its facts name (a
+# local record's, or a tag-object green record's); empty for a lightweight
+# record and on every refusal.
 kit_record_trusted() {
-  local repo="$1" sha="$2" job="$3" key="${4:-}" check="${5:-$3}" actual count
+  local repo="$1" sha="$2" job="$3" key="${4:-}" check="${5:-$3}" actual count commit
+  KIT_RECORD_PLATFORM="" KIT_RECORD_REASON=""
   if [[ "${6:-}" == refs/ci/local/* ]]; then
     kit_local_record_trusted "$sha" "$job" "$key" "$6"
     return
   fi
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 2
-  actual="$(kit_key "$sha" "$job" 2>/dev/null)" || return 2
+  commit="$(git -C "${KIT_KEYS_REPO:-.}" rev-parse --verify -q "${sha}^{commit}" 2>/dev/null)" || return 2
+  actual="$(kit_key "$commit" "$job" 2>/dev/null)" || return 2
   [ "$actual" = "$key" ] || return 2
-  [ -n "$repo" ] || return 1
-  count="$(gh api "repos/${repo}/commits/${sha}/check-runs?check_name=${check}&filter=all&per_page=100" \
+  if [ "$(git -C "${KIT_KEYS_REPO:-.}" cat-file -t "$sha" 2>/dev/null)" = tag ]; then
+    kit__green_facts "$sha" "$job" "$key" "$commit" || return 3
+  fi
+  [ -n "$repo" ] || { KIT_RECORD_PLATFORM=""; return 1; }
+  count="$(gh api "repos/${repo}/commits/${commit}/check-runs?check_name=${check}&filter=all&per_page=100" \
     --jq '[.check_runs[] | select(.conclusion == "success" and .app.slug == "github-actions")] | length' 2>/dev/null)" \
-    || return 1
-  [ "${count:-0}" -gt 0 ]
+    || { KIT_RECORD_PLATFORM=""; return 1; }
+  [ "${count:-0}" -gt 0 ] || { KIT_RECORD_PLATFORM=""; return 1; }
+}
+
+# kit__green_facts <tag object> <job> <key> <commit>: 0 when the tag names
+# <commit> directly and its facts block agrees with its ref, KIT_RECORD_PLATFORM
+# then set; else non-zero with KIT_RECORD_REASON. The facts: the first line
+# `<project>-green v1`; `job`, `key` and `commit` the ref's job, the ref's key
+# and the peeled commit; for a `local` job, whose verdict runs in the job
+# image, a `platform` of linux/amd64 or linux/arm64 and an `image` id; for any
+# other job, a `platform` of KIT_PLATFORM_SHAPE. A `platform` line absent or
+# given twice is no platform.
+kit__green_facts() {
+  local obj="$1" job="$2" key="$3" commit="$4" raw header facts value class="" i
+  local format
+  # The loaded manifest's project and job classes, as the local arm reads
+  # them; a caller that loaded none gets the record commit's.
+  [ -n "${KIT_PROJECT:-}" ] || kit_manifest_load "$commit" 2>/dev/null \
+    || { KIT_RECORD_REASON="the ci/manifest of its commit could not be read"; return 1; }
+  format="${KIT_PROJECT}-green v1"
+  raw="$(git -C "${KIT_KEYS_REPO:-.}" cat-file tag "$obj" 2>/dev/null)" || { KIT_RECORD_REASON='its tag object could not be read'; return 1; }
+  header="$(sed '/^$/q' <<< "$raw")"
+  facts="$(sed '1,/^$/d' <<< "$raw")"
+  if [ "$(awk '$1 == "type" { print $2; exit }' <<< "$header")" != commit ] \
+      || [ "$(awk '$1 == "object" { print $2; exit }' <<< "$header")" != "$commit" ]; then
+    KIT_RECORD_REASON='it is a tag that does not point at a commit'; return 1
+  fi
+  if [ "$(awk 'NR == 1' <<< "$facts")" != "$format" ]; then
+    KIT_RECORD_REASON="its facts are not in the ${format} format"; return 1
+  fi
+  if [ "$(kit__local_fact "$facts" job)" != "$job" ] || [ "$(kit__local_fact "$facts" key)" != "$key" ] \
+      || [ "$(kit__local_fact "$facts" commit)" != "$commit" ]; then
+    KIT_RECORD_REASON="its facts' job, key or commit differ from its ref and its commit"; return 1
+  fi
+  for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
+    [ "${KIT_JOBS[$i]}" = "$job" ] && class="${KIT_JOB_CLASS[$i]}"
+  done
+  value="$(kit__local_fact "$facts" platform)" || value=""
+  if [ "$class" = local ]; then
+    case "$value" in
+      linux/amd64 | linux/arm64) ;;
+      "") KIT_RECORD_REASON='it records no platform'; return 1 ;;
+      *) KIT_RECORD_REASON="it records the platform ${value}, and a local job's verdict runs in its image on linux/amd64 or linux/arm64"; return 1 ;;
+    esac
+    if ! [[ "$(kit__local_fact "$facts" image)" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      KIT_RECORD_REASON='it records no image id of the job image'; return 1
+    fi
+  elif [ -z "$value" ]; then
+    KIT_RECORD_REASON='it records no platform'; return 1
+  elif ! [[ "$value" =~ $KIT_PLATFORM_SHAPE ]]; then
+    KIT_RECORD_REASON="it records the platform ${value}, which is not of the shape <os>/<arch>"; return 1
+  fi
+  KIT_RECORD_PLATFORM="$value"
 }
 
 # --- LOCAL RECORDS (DESIGN.md 6.5 to 6.7) ----------------------------------
@@ -599,7 +696,7 @@ kit__local_check() {
   local dir="$1" obj="$2" job="$3" key="$4" repo="${KIT_KEYS_REPO:-.}"
   local main="refs/remotes/origin/${KIT_MAIN_BRANCH}" signers="$KIT_SIGNERS"
   local format="${KIT_PROJECT}-local-ci v${KIT_LOCAL_EPOCH}"
-  local header facts commit principals principal n tool field value pin legs leg allowed actual
+  local header facts commit principals principal n tool field value pin legs leg allowed actual platform
   # 6. Neither a force nor a weekly dispatch.
   if [ "${CI_PLAN_FORCE:-false}" = true ]; then kit__local_no 'is ignored on a force dispatch'; return 4; fi
   if [ "${CI_PLAN_TASK:-}" = weekly ]; then kit__local_no 'is ignored on a weekly dispatch'; return 4; fi
@@ -644,6 +741,7 @@ kit__local_check() {
     kit__local_no "is not in the ${format} format"; return 4
   fi
   value="$(kit__local_fact "$facts" platform)" || value=""
+  platform="$value"
   case "$value" in
     linux/amd64 | linux/arm64) ;;
     linux/*) kit__local_no "records the platform ${value}, which is neither linux/amd64 nor linux/arm64"; return 4 ;;
@@ -689,6 +787,7 @@ kit__local_check() {
     done <<< "$legs"
   fi
   KIT_LOCAL_PRINCIPAL="$principal"
+  KIT_RECORD_PLATFORM="$platform"
   return 0
 }
 
@@ -701,7 +800,7 @@ kit__local_check() {
 # git and ssh-keygen; no API call.
 kit_local_record_trusted() {
   local obj="$1" job="$2" key="$3" ref="$4" dir rc=0 class="" i
-  KIT_LOCAL_REASON="" KIT_LOCAL_PRINCIPAL=""
+  KIT_LOCAL_REASON="" KIT_LOCAL_PRINCIPAL="" KIT_RECORD_PLATFORM=""
   for ((i = 0; i < ${#KIT_JOBS[@]}; i++)); do
     [ "${KIT_JOBS[$i]}" = "$job" ] && class="${KIT_JOB_CLASS[$i]}"
   done

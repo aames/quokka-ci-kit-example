@@ -31,6 +31,11 @@ fam_driver() {
   rc_is "a tool off its pin in the job image" 2 "$DRV_RC"; has "names the tool, the version and the pin" "$work/drv.out" "go go9.9.9 is not the pinned go1.27.3 in the job image, so alpha did not run."
   hasnt "and no job container ran" "$DOCKER_LOG" cikit-enter
   unset SHIM_V_go
+  # This computer's platform unread (an empty uname): refused, never `host /`.
+  mkdir -p "$work/nouname"; printf '#!/bin/sh\nexit 0\n' > "$work/nouname/uname"; chmod +x "$work/nouname/uname"
+  KITT_PATH_PRE="$work/nouname" drv run --commit HEAD alpha
+  rc_is "a host whose uname says nothing" 2 "$DRV_RC"; has "is refused in one sentence" "$work/drv.out" "This computer did not say its platform, so alpha did not run."
+  hasnt "and no job container ran" "$DOCKER_LOG" cikit-enter
   export SHIM_V_node=v99.0.0
   drv run --commit HEAD alpha; rc_is "node off its pin (a file read as data)" 2 "$DRV_RC"
   unset SHIM_V_node

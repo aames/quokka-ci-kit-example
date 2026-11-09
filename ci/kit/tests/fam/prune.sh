@@ -15,7 +15,7 @@ prune_run() { # prune_run <class> <delete>
 remote_has() { [ -n "$(git -C "$FX" ls-remote origin "$1")" ]; }
 fam_prune() {
   need_bash4 prune || return 0
-  local c31 c29 c100 k tip
+  local c31 c29 c100 k tip c obj
   fx_new prune
   tip="$(git -C "$FX" rev-parse HEAD)"
   c31="$(prune_commit 31 old)"; c29="$(prune_commit 29 young)"; c100="$(prune_commit 100 ancient)"
@@ -34,6 +34,17 @@ fam_prune() {
   check "29 days old is kept" remote_has "refs/ci/green/alpha/$(printf '2%.0s' $(seq 1 64))"
   check "the main tip's key is kept at 100 days" remote_has "refs/ci/green/alpha/$k"
   check "an old record of a job the tip's keys do not name is deleted" test -z "$(git -C "$FX" ls-remote origin "refs/ci/green/beta/$(printf '3%.0s' $(seq 1 64))")"
+  # a green record that is a tag object (v1.2.0 and later): its age is its commit's committer date
+  printf 'kitfix-green v1\n' > "$work/gm"
+  for c in "$c31:6" "$c29:7"; do
+    obj="$(printf 'object %s\ntype commit\ntag ci/green/alpha/x\ntagger github-actions[bot] <bot@invalid> %s +0000\n\n' "${c%:*}" "$(python3 -c 'import time;print(int(time.time()))')" | cat - "$work/gm" | git -C "$FX" mktag)"
+    git -C "$FX" push -q --no-verify origin "$obj:refs/ci/green/alpha/$(printf "${c#*:}%.0s" $(seq 1 64))"
+  done
+  prune_run green true
+  rc_is "the prune of tag-object green records" 0 "$PRUNE_RC"
+  check "a tag object whose commit is 31 days old is deleted" test -z "$(git -C "$FX" ls-remote origin "refs/ci/green/alpha/$(printf '6%.0s' $(seq 1 64))")"
+  check "a tag object whose commit is 29 days old is kept" remote_has "refs/ci/green/alpha/$(printf '7%.0s' $(seq 1 64))"
+  hasnt "and neither is kept for want of a date" "$work/prune.out" "has no tagger date"
   # local records: tagger date; a lightweight ref names no tagger date
   git -C "$FX" fetch -q origin
   when="$(python3 -c "import time;print(int(time.time())-40*86400)")"

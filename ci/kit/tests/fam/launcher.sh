@@ -10,7 +10,7 @@ launch() { # launch <job> [VAR=value...]: LCH_RC, the docker record
   for kv in "$@"; do unset "${kv%%=*}"; done
 }
 fam_launcher() {
-  local line hard names
+  local line hard names ran
   fx_new lch
   launch alpha
   rc_is "alpha, a service job" 0 "$LCH_RC"
@@ -18,6 +18,19 @@ fam_launcher() {
   case "$line" in *"--network kitfix-ci-T1"*) ok "alpha joins its run network" ;; *) bad "alpha network: $line" ;; esac
   case "$line" in *docker.sock* | *"--group-add"* | *"--network host"*) bad "a socket or host network on alpha: $line" ;; *) ok "alpha holds no socket, no group and no host network" ;; esac
   has "alpha's sidecar is on the same network" "$DOCKER_LOG" "run -d --name kitfix-check-postgres-T1 --network kitfix-ci-T1"
+  # the ran file: the platform read inside the job image, after a pass (DESIGN.md 5.2)
+  ran="$(state_dir)/ran/alpha/$(fx_key alpha)"
+  eq "a pass writes the ran file: the image's platform and the image id" "platform linux/arm64 image sha256:" \
+    "$(sed -E 's/^(image sha256:)[0-9a-f]{64}$/\1/' "$ran" 2> /dev/null | tr '\n' ' ' | sed 's/ $//')"
+  line="$(grep -- 'uname -s -m' "$DOCKER_LOG" | tail -1)"
+  case "$line" in *"--network none --security-opt no-new-privileges --cap-drop ALL --user 1001:1001 kitfix-ci-job:"*) ok "the platform is read in the job image with no network and the hardening" ;; *) bad "the ran file's uname: $line" ;; esac
+  launch alpha ADAPTER_alpha=fail
+  rc_is "a failing job" 1 "$LCH_RC"
+  check "removes an earlier ran file and writes none" test ! -e "$ran"
+  launch alpha SHIM_UNAME_FAIL=1
+  rc_is "a pass whose image says no platform is refused" 2 "$LCH_RC"
+  has "with the sentence" "$work/lch.out" "alpha passed, but its image did not say its platform, so no record can be written for it."
+  check "and writes no ran file" test ! -e "$ran"
   launch delta
   rc_is "delta, the socket and history job" 0 "$LCH_RC"
   line="$(grep 'cikit-enter delta' "$DOCKER_LOG")"

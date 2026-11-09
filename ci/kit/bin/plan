@@ -8,10 +8,11 @@
 #   2. One `git ls-remote` naming the exact record refs: refs/ci/green/<job>/
 #      <key> for every job, and refs/ci/local/<job>/<key> for every `local`
 #      and `ci-only` job; then the trust check of each hit.
-#   3. Emit one decision per job to $GITHUB_OUTPUT, each key, `main` and
-#      `ref_group`; then source the manifest's plan extension, if it names one.
+#   3. Emit one decision per job to $GITHUB_OUTPUT, each key, each platform,
+#      `main` and `ref_group`; then source the manifest's plan extension, if
+#      it names one.
 #   4. Write a summary table to $GITHUB_STEP_SUMMARY: job, key, record,
-#      provenance, decision. This is how a skip is SEEN.
+#      platform, provenance, decision. This is how a skip is SEEN.
 #
 # MODES, decided in this order, before any record is read:
 #   task:<name>  a dispatch whose task is neither `tests` nor `weekly`: every
@@ -38,7 +39,15 @@
 # commit fetched at depth 1 first when absent), and that commit carries a
 # SUCCESSFUL check run of the job's check name (the job's name, or its
 # manifest `check-name`) from the github-actions app. An untrusted record is
-# ignored and the job runs; the summary says why.
+# ignored and the job runs; the summary says why. A green record is a commit
+# (a lightweight ref, before v1.2.0) or a tag object of one carrying the facts
+# block; a tag object's facts must agree with its ref (the library's
+# kit__green_facts).
+#
+# THE PLATFORM. A skip on a record shows the platform its verdict ran on, from
+# the record's facts: the Platform column, the note and the output
+# <job>_platform (empty, and `-` in the table, for a lightweight record or
+# when nothing was skipped on a record).
 #
 # THE MAIN BRANCH IS DECIDED HERE, CASE-SENSITIVELY: `main=true` only when
 # GITHUB_REF is exactly refs/heads/<main-branch>, compared by the shell,
@@ -141,11 +150,12 @@ check_name() {
   printf '%s\n' "${named:-$1}"
 }
 
-declare -A key decision note provenance
+declare -A key decision note provenance platform
 for job in "${jobs[@]}"; do
   key[$job]="$(kit_key "$CI_PLAN_SHA" "$job")" \
     || fail "the key of ${job} at ${CI_PLAN_SHA:0:12} could not be computed. Nothing was run."
   provenance[$job]='-'
+  platform[$job]='-'
 done
 
 main=false
@@ -192,7 +202,8 @@ decide_by_records() {
   fi
   # The key is recomputed from the record's own commit, which a depth-1
   # checkout does not hold: every absent hit is fetched at depth 1 by its
-  # record ref (a local ref brings its tag object and the tag's commit). A
+  # record ref (a tag-object ref, green or local, brings the tag object and
+  # the tag's commit). A
   # fetch that fails leaves the commit absent, and an absent commit is never
   # trusted.
   while read -r hit ref; do
@@ -222,9 +233,13 @@ decide_by_records() {
       note[$job]='no record for this key'
     elif [ "$rc" -eq 0 ]; then
       decision[$job]=green
-      note[$job]="record at ${hit:0:12}, trusted"
+      note[$job]="record at ${hit:0:12}, trusted${KIT_RECORD_PLATFORM:+, ${KIT_RECORD_PLATFORM}}"
       provenance[$job]='ci'
+      platform[$job]="${KIT_RECORD_PLATFORM:--}"
       continue
+    elif [ "$rc" -eq 3 ]; then
+      decision[$job]=run
+      note[$job]="record at ${hit:0:12} NOT TRUSTED: ${KIT_RECORD_REASON:-its facts could not be checked}"
     elif [ "$rc" -eq 2 ]; then
       decision[$job]=run
       note[$job]="record at ${hit:0:12} NOT TRUSTED: the key of ${hit:0:12} for '${job}' is not this key, or that commit could not be read"
@@ -240,8 +255,9 @@ decide_by_records() {
     kit_record_trusted "$CI_PLAN_REPO" "$lhit" "$job" "${key[$job]}" "$job" "$lref" || lrc=$?
     if [ "$lrc" -eq 0 ]; then
       decision[$job]=green
-      note[$job]="local record at ${lhit:0:12}, trusted"
+      note[$job]="local record at ${lhit:0:12}, trusted${KIT_RECORD_PLATFORM:+, ${KIT_RECORD_PLATFORM}}"
       provenance[$job]="local: ${KIT_LOCAL_PRINCIPAL}"
+      platform[$job]="${KIT_RECORD_PLATFORM:--}"
     else
       # The job runs, and one sentence says which condition failed.
       sentence="${job}: the local record for ${key[$job]:0:8} ${KIT_LOCAL_REASON:-could not be checked}, so ${job} ran."
@@ -289,13 +305,13 @@ esac
 
 # KIT_KEY, KIT_MODE, KIT_MAIN, KIT_REF_GROUP and KIT_SHA are the extension's
 # inputs, read by the file sourced below (SC2034 cannot see that).
-# THE SNAPSHOT (kit/README.md §4.4): every kit job's decision, key, note and
-# provenance, taken before the source. It is an accident check for the
+# THE SNAPSHOT (kit/README.md §4.4): every kit job's decision, key, note,
+# provenance and platform, taken before the source. It is an accident check for the
 # adopter's own reviewed code, never a boundary: after the source a changed
 # decision or key fails the plan, and every kit job's outputs and summary row
 # are written from the snapshot, never from arrays the extension could touch.
 declare -A KIT_KEY KIT_DECISION KIT_NOTE KIT_PROVENANCE kit_declared
-declare -A kit_snap_decision kit_snap_key kit_snap_note kit_snap_provenance
+declare -A kit_snap_decision kit_snap_key kit_snap_note kit_snap_provenance kit_snap_platform
 # shellcheck disable=SC2034
 for job in "${jobs[@]}"; do
   KIT_KEY[$job]="${key[$job]}"
@@ -307,6 +323,7 @@ for job in "${jobs[@]}"; do
   kit_snap_key[$job]="${key[$job]}"
   kit_snap_note[$job]="${note[$job]}"
   kit_snap_provenance[$job]="${provenance[$job]}"
+  kit_snap_platform[$job]="${platform[$job]}"
 done
 # shellcheck disable=SC2034
 KIT_MODE="$mode" KIT_MAIN="$main" KIT_REF_GROUP="$ref_group" KIT_SHA="$CI_PLAN_SHA"
@@ -338,7 +355,7 @@ kit_decide() {
 }
 
 # kit_output <name> <value>: one more step output. The kit's own names
-# (<job>, <job>_key, main, ref_group) are refused, and a value holding a
+# (<job>, <job>_key, <job>_platform, main, ref_group) are refused, and a value holding a
 # newline, which would write a second output, is refused.
 kit_output() {
   local name="${1:-}" value="${2:-}" job
@@ -346,7 +363,7 @@ kit_output() {
     || fail "the plan extension wrote an output named '${name}', which is not an output name, so nothing ran."
   case "$value" in *$'\n'* | *$'\r'*) fail "the plan extension wrote a value for ${name} holding a line break, so nothing ran." ;; esac
   for job in "${jobs[@]}"; do
-    if [ "$name" = "$job" ] || [ "$name" = "${job}_key" ]; then
+    if [ "$name" = "$job" ] || [ "$name" = "${job}_key" ] || [ "$name" = "${job}_platform" ]; then
       fail "the plan extension wrote the output ${name}, which is the kit's, so nothing ran."
     fi
   done
@@ -355,9 +372,9 @@ kit_output() {
 }
 
 # kit_summary_row <job> <key or -> <note> <provenance> <decision>: one more
-# row of the summary table, after the kit's.
+# row of the summary table, after the kit's; its Platform cell is `-`.
 kit_summary_row() {
-  ext_rows+=("$(printf '| %s | %s | %s | %s | **%s** |' "${1:-}" "${2:--}" "${3:-}" "${4:--}" "${5:-}")")
+  ext_rows+=("$(printf '| %s | %s | %s | - | %s | **%s** |' "${1:-}" "${2:--}" "${3:-}" "${4:--}" "${5:-}")")
 }
 
 if [ -n "$KIT_PLAN_EXTENSION" ]; then
@@ -384,6 +401,12 @@ fi
   for job in "${jobs[@]}"; do
     printf '%s_key=%s\n' "$job" "${kit_snap_key[$job]}"
   done
+  # The platform a skip rests on; empty where the table shows `-`.
+  for job in "${jobs[@]}"; do
+    value="${kit_snap_platform[$job]}"
+    [ "$value" != - ] || value=""
+    printf '%s_platform=%s\n' "$job" "$value"
+  done
   printf 'main=%s\n' "$main"
   printf 'ref_group=%s\n' "$ref_group"
   for line in ${ext_outputs[@]+"${ext_outputs[@]}"}; do
@@ -393,15 +416,17 @@ fi
 
 {
   printf '### CI plan for %s (%s, main: %s)\n\n' "${CI_PLAN_SHA:0:12}" "$CI_PLAN_EVENT" "$main"
+  # Platform: where the verdict a skip rests on ran, from the record's facts;
+  # `-` for a lightweight record or where nothing was skipped on a record.
   # Provenance: which record a skip rests on, `ci` (a check run vouched for
   # it) or `local: <principal>` (main's signers file named the signer); `-`
   # where nothing was skipped on a record.
-  printf '| Job | Key | Record | Provenance | Decision |\n|---|---|---|---|---|\n'
+  printf '| Job | Key | Record | Platform | Provenance | Decision |\n|---|---|---|---|---|---|\n'
   for job in "${jobs[@]}"; do
-    printf '| %s | %s%s%s | %s | %s | **%s** |\n' "$job" '`' "${kit_snap_key[$job]:0:16}" '`' "${kit_snap_note[$job]}" "${kit_snap_provenance[$job]}" "${kit_snap_decision[$job]}"
+    printf '| %s | %s%s%s | %s | %s | %s | **%s** |\n' "$job" '`' "${kit_snap_key[$job]:0:16}" '`' "${kit_snap_note[$job]}" "${kit_snap_platform[$job]}" "${kit_snap_provenance[$job]}" "${kit_snap_decision[$job]}"
   done
   for job in ${ext_jobs[@]+"${ext_jobs[@]}"}; do
-    printf '| %s | - | %s | %s | **%s** |\n' "$job" "${KIT_NOTE[$job]}" "${KIT_PROVENANCE[$job]}" "${KIT_DECISION[$job]}"
+    printf '| %s | - | %s | - | %s | **%s** |\n' "$job" "${KIT_NOTE[$job]}" "${KIT_PROVENANCE[$job]}" "${KIT_DECISION[$job]}"
   done
   for line in ${ext_rows[@]+"${ext_rows[@]}"}; do
     printf '%s\n' "$line"

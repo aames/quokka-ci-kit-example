@@ -283,22 +283,27 @@ cmd_sign() {
     made="$(git rev-parse --verify "refs/tags/${tmp}")"
     git update-ref "$ref" "$made" "" || { git update-ref -d "refs/tags/${tmp}" "$made"; refuse "The ${job} record could not be written at ${ref}."; }
     git update-ref -d "refs/tags/${tmp}" "$made"
-    say "${job}: signed ${ref} (tag object ${made:0:12}, commit ${obj:0:8})."
+    say "${job}: signed ${ref} (tag object ${made:0:12}, commit ${obj:0:8}, $(fact "$entry" platform))."
   done
 }
 
 # --- push ------------------------------------------------------------------------
 
 cmd_push() {
-  local job key ref obj rc line failed=0 err="${base}/logs/push-$$.err"
+  local job key ref obj rc line failed=0 err="${base}/logs/push-$$.err" plat
+  local msg="${base}/logs/push-$$.msg"
   for job in "${jobs[@]}"; do
     key="$(key_at "$sha" "$job")" || refuse "The ${job} key for ${sha:0:8} could not be computed, so nothing was pushed."
     ref="refs/ci/local/${job}/${key}"
     obj="$(git rev-parse --verify -q "$ref")" || refuse "${job} for ${sha:0:8} is not signed, so nothing was pushed."
+    # The platform the record names, from its own facts.
+    git cat-file tag "$obj" > "$msg" 2> /dev/null || : > "$msg"
+    plat="$(fact "$msg" platform)"
+    rm -f -- "$msg"
     rc=0
     git push --no-verify --quiet "$remote" "${obj}:${ref}" 2> "$err" || rc=$?
     if [ "$rc" -eq 0 ]; then
-      say "${job}: pushed ${ref} to ${remote}."
+      say "${job}: pushed ${ref} to ${remote} (${plat:-no platform})."
     elif [ -n "$(git ls-remote "$remote" "$ref" 2> /dev/null || true)" ]; then
       say "${job}: ${remote} already has ${ref}, so the record stands."
     else
@@ -353,17 +358,11 @@ lock_take() {
   printf '%s\n' "$$" > "${lock}/pid"
 }
 
-# platform_of <uname -s> <uname -m>: `<os>/<arch>`, lower-case system;
-# x86_64 is amd64, aarch64 is arm64.
+# platform_of <uname -s> <uname -m>: `<os>/<arch>` by the sibling library's
+# kit_platform_of, the one computer of the string, in a child under "$BASH".
 platform_of() {
-  local os="$1" arch="$2"
-  case "$os" in
-    Linux) os=linux ;;
-    Darwin) os=darwin ;;
-    *) os="$(tr '[:upper:]' '[:lower:]' <<< "$os")" ;;
-  esac
-  case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
-  printf '%s/%s\n' "$os" "$arch"
+  # shellcheck disable=SC2016
+  "$BASH" -c '. "$1"; kit_platform_of "$2" "$3"' _ "${here}/../lib/keys.sh" "$1" "$2"
 }
 
 # The image's answers to the reader, as two lists side by side, and the
@@ -554,7 +553,8 @@ cmd_run() {
     linux/*) ;;
     *) refuse "The job image runs on ${container_platform}, not Linux, so ${jobs[*]} did not run." ;;
   esac
-  host_platform="$(platform_of "$(uname -s)" "$(uname -m)")"
+  host_platform="$(platform_of "$(uname -s)" "$(uname -m)")" || host_platform=""
+  [ -n "$host_platform" ] || refuse "This computer did not say its platform, so ${jobs[*]} did not run."
   docker_version="$(docker version --format '{{.Server.Version}}' 2> /dev/null)" || docker_version=""
   [ -n "$docker_version" ] || docker_version=unknown
 
