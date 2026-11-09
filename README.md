@@ -86,6 +86,9 @@ and pushed. Anything else runs first, and a failure stops the push. `git push
 
 In CI, the `checks` job plans the run. Its summary table lists each job with
 its key, the record it found (if any), who made it, and whether the job runs.
+Each record also names the platform its verdict ran on, `linux/amd64` for
+one CI wrote and this Mac's `linux/arm64` for one `make check` signed, and the
+table shows it in a Platform column.
 
 ## Layout
 
